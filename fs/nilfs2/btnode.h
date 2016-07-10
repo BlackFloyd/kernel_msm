@@ -13,12 +13,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- * Written by Seiji Kihara <kihara@osrg.net>
- * Revised by Ryusuke Konishi <ryusuke@osrg.net>
+ * Written by Seiji Kihara.
+ * Revised by Ryusuke Konishi.
  */
 
 #ifndef _NILFS_BTNODE_H
@@ -29,7 +25,13 @@
 #include <linux/fs.h>
 #include <linux/backing-dev.h>
 
-
+/**
+ * struct nilfs_btnode_chkey_ctxt - change key context
+ * @oldkey: old key of block's moving content
+ * @newkey: new key for block's content
+ * @bh: buffer head of old buffer
+ * @newbh: buffer head of new buffer
+ */
 struct nilfs_btnode_chkey_ctxt {
 	__u64 oldkey;
 	__u64 newkey;

@@ -17,14 +17,12 @@
 #include <linux/delay.h>
 #include <linux/workqueue.h>
 #include <linux/kmod.h>
-#include <linux/wakelock.h>
-#include <linux/wakeup_reason.h>
-#include "power.h"
+#include <trace/events/power.h>
 
 /* 
  * Timeout for stopping processes
  */
-#define TIMEOUT	(20 * HZ)
+unsigned int __read_mostly freeze_timeout_msecs = 20 * MSEC_PER_SEC;
 
 static int try_to_freeze_tasks(bool user_only)
 {
@@ -32,16 +30,14 @@ static int try_to_freeze_tasks(bool user_only)
 	unsigned long end_time;
 	unsigned int todo;
 	bool wq_busy = false;
-	struct timeval start, end;
-	u64 elapsed_msecs64;
+	ktime_t start, end, elapsed;
 	unsigned int elapsed_msecs;
 	bool wakeup = false;
 	int sleep_usecs = USEC_PER_MSEC;
-	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
 
-	do_gettimeofday(&start);
+	start = ktime_get_boottime();
 
-	end_time = jiffies + TIMEOUT;
+	end_time = jiffies + msecs_to_jiffies(freeze_timeout_msecs);
 
 	if (!user_only)
 		freeze_workqueues_begin();
@@ -49,24 +45,13 @@ static int try_to_freeze_tasks(bool user_only)
 	while (true) {
 		todo = 0;
 		read_lock(&tasklist_lock);
-		do_each_thread(g, p) {
+		for_each_process_thread(g, p) {
 			if (p == current || !freeze_task(p))
 				continue;
 
-			/*
-			 * Now that we've done set_freeze_flag, don't
-			 * perturb a task in TASK_STOPPED or TASK_TRACED.
-			 * It is "frozen enough".  If the task does wake
-			 * up, it will immediately call try_to_freeze.
-			 *
-			 * Because freeze_task() goes through p's scheduler lock, it's
-			 * guaranteed that TASK_STOPPED/TRACED -> TASK_RUNNING
-			 * transition can't race with task state testing here.
-			 */
-			if (!task_is_stopped_or_traced(p) &&
-			    !freezer_should_skip(p))
+			if (!freezer_should_skip(p))
 				todo++;
-		} while_each_thread(g, p);
+		}
 		read_unlock(&tasklist_lock);
 
 		if (!user_only) {
@@ -78,11 +63,6 @@ static int try_to_freeze_tasks(bool user_only)
 			break;
 
 		if (pm_wakeup_pending()) {
-#ifndef CONFIG_UML
-			pm_get_active_wakeup_sources(suspend_abort,
-				MAX_SUSPEND_ABORT_LEN);
-#endif
-			log_suspend_abort_reason(suspend_abort);
 			wakeup = true;
 			break;
 		}
@@ -97,31 +77,29 @@ static int try_to_freeze_tasks(bool user_only)
 			sleep_usecs *= 2;
 	}
 
-	do_gettimeofday(&end);
-	elapsed_msecs64 = timeval_to_ns(&end) - timeval_to_ns(&start);
-	do_div(elapsed_msecs64, NSEC_PER_MSEC);
-	elapsed_msecs = elapsed_msecs64;
+	end = ktime_get_boottime();
+	elapsed = ktime_sub(end, start);
+	elapsed_msecs = ktime_to_ms(elapsed);
 
-	if (wakeup) {
-		printk("\n");
-		printk(KERN_ERR "Freezing of tasks aborted after %d.%03d seconds",
-		       elapsed_msecs / 1000, elapsed_msecs % 1000);
-	} else if (todo) {
-		printk("\n");
-		printk(KERN_ERR "Freezing of tasks failed after %d.%03d seconds"
-		       " (%d tasks refusing to freeze, wq_busy=%d):\n",
+	if (todo) {
+		pr_cont("\n");
+		pr_err("Freezing of tasks %s after %d.%03d seconds "
+		       "(%d tasks refusing to freeze, wq_busy=%d):\n",
+		       wakeup ? "aborted" : "failed",
 		       elapsed_msecs / 1000, elapsed_msecs % 1000,
 		       todo - wq_busy, wq_busy);
 
-		read_lock(&tasklist_lock);
-		do_each_thread(g, p) {
-			if (p != current && !freezer_should_skip(p)
-			    && freezing(p) && !frozen(p))
-				sched_show_task(p);
-		} while_each_thread(g, p);
-		read_unlock(&tasklist_lock);
+		if (!wakeup) {
+			read_lock(&tasklist_lock);
+			for_each_process_thread(g, p) {
+				if (p != current && !freezer_should_skip(p)
+				    && freezing(p) && !frozen(p))
+					sched_show_task(p);
+			}
+			read_unlock(&tasklist_lock);
+		}
 	} else {
-		printk("(elapsed %d.%03d seconds) ", elapsed_msecs / 1000,
+		pr_cont("(elapsed %d.%03d seconds) ", elapsed_msecs / 1000,
 			elapsed_msecs % 1000);
 	}
 
@@ -130,6 +108,8 @@ static int try_to_freeze_tasks(bool user_only)
 
 /**
  * freeze_processes - Signal user space processes to enter the refrigerator.
+ * The current thread will not be frozen.  The same process that calls
+ * freeze_processes must later call thaw_processes.
  *
  * On success, returns 0.  On failure, -errno and system is fully thawed.
  */
@@ -141,19 +121,42 @@ int freeze_processes(void)
 	if (error)
 		return error;
 
+	/* Make sure this task doesn't get frozen */
+	current->flags |= PF_SUSPEND_TASK;
+
 	if (!pm_freezing)
 		atomic_inc(&system_freezing_cnt);
 
-	printk("Freezing user space processes ... ");
+	pm_wakeup_clear();
+	pr_info("Freezing user space processes ... ");
 	pm_freezing = true;
 	error = try_to_freeze_tasks(true);
 	if (!error) {
-		printk("done.");
 		__usermodehelper_set_disable_depth(UMH_DISABLED);
-		oom_killer_disable();
+		pr_cont("done.");
 	}
-	printk("\n");
+	pr_cont("\n");
 	BUG_ON(in_atomic());
+
+	/*
+	 * Now that the whole userspace is frozen we need to disbale
+	 * the OOM killer to disallow any further interference with
+	 * killable tasks.
+	 */
+	if (!error && !oom_killer_disable())
+		error = -EBUSY;
+
+	/*
+	 * There is a hard to fix race between oom_reaper kernel thread
+	 * and oom_killer_disable. oom_reaper calls exit_oom_victim
+	 * before the victim reaches exit_mm so try to freeze all the tasks
+	 * again and catch such a left over task.
+	 */
+	if (!error) {
+		pr_info("Double checking all user space processes after OOM killer disable... ");
+		error = try_to_freeze_tasks(true);
+		pr_cont("\n");
+	}
 
 	if (error)
 		thaw_processes();
@@ -172,13 +175,14 @@ int freeze_kernel_threads(void)
 {
 	int error;
 
-	printk("Freezing remaining freezable tasks ... ");
+	pr_info("Freezing remaining freezable tasks ... ");
+
 	pm_nosig_freezing = true;
 	error = try_to_freeze_tasks(false);
 	if (!error)
-		printk("done.");
+		pr_cont("done.");
 
-	printk("\n");
+	pr_cont("\n");
 	BUG_ON(in_atomic());
 
 	if (error)
@@ -189,7 +193,9 @@ int freeze_kernel_threads(void)
 void thaw_processes(void)
 {
 	struct task_struct *g, *p;
+	struct task_struct *curr = current;
 
+	trace_suspend_resume(TPS("thaw_processes"), 0, true);
 	if (pm_freezing)
 		atomic_dec(&system_freezing_cnt);
 	pm_freezing = false;
@@ -197,20 +203,27 @@ void thaw_processes(void)
 
 	oom_killer_enable();
 
-	printk("Restarting tasks ... ");
+	pr_info("Restarting tasks ... ");
 
+	__usermodehelper_set_disable_depth(UMH_FREEZING);
 	thaw_workqueues();
 
 	read_lock(&tasklist_lock);
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
+		/* No other threads should have PF_SUSPEND_TASK set */
+		WARN_ON((p != curr) && (p->flags & PF_SUSPEND_TASK));
 		__thaw_task(p);
-	} while_each_thread(g, p);
+	}
 	read_unlock(&tasklist_lock);
+
+	WARN_ON(!(curr->flags & PF_SUSPEND_TASK));
+	curr->flags &= ~PF_SUSPEND_TASK;
 
 	usermodehelper_enable();
 
 	schedule();
-	printk("done.\n");
+	pr_cont("done.\n");
+	trace_suspend_resume(TPS("thaw_processes"), 0, false);
 }
 
 void thaw_kernel_threads(void)
@@ -218,17 +231,17 @@ void thaw_kernel_threads(void)
 	struct task_struct *g, *p;
 
 	pm_nosig_freezing = false;
-	printk("Restarting kernel threads ... ");
+	pr_info("Restarting kernel threads ... ");
 
 	thaw_workqueues();
 
 	read_lock(&tasklist_lock);
-	do_each_thread(g, p) {
+	for_each_process_thread(g, p) {
 		if (p->flags & (PF_KTHREAD | PF_WQ_WORKER))
 			__thaw_task(p);
-	} while_each_thread(g, p);
+	}
 	read_unlock(&tasklist_lock);
 
 	schedule();
-	printk("done.\n");
+	pr_cont("done.\n");
 }

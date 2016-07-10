@@ -66,23 +66,24 @@ void rds_tcp_xmit_complete(struct rds_connection *conn)
 static int rds_tcp_sendmsg(struct socket *sock, void *data, unsigned int len)
 {
 	struct kvec vec = {
-                .iov_base = data,
-                .iov_len = len,
+		.iov_base = data,
+		.iov_len = len,
 	};
-        struct msghdr msg = {
-                .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL,
-        };
+	struct msghdr msg = {
+		.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL,
+	};
 
 	return kernel_sendmsg(sock, &msg, &vec, 1, vec.iov_len);
 }
 
 /* the core send_sem serializes this with other xmit and shutdown */
 int rds_tcp_xmit(struct rds_connection *conn, struct rds_message *rm,
-	         unsigned int hdr_off, unsigned int sg, unsigned int off)
+		 unsigned int hdr_off, unsigned int sg, unsigned int off)
 {
 	struct rds_tcp_connection *tc = conn->c_transport_data;
 	int done = 0;
 	int ret = 0;
+	int more;
 
 	if (hdr_off == 0) {
 		/*
@@ -93,7 +94,7 @@ int rds_tcp_xmit(struct rds_connection *conn, struct rds_message *rm,
 		rm->m_ack_seq = tc->t_last_sent_nxt +
 				sizeof(struct rds_header) +
 				be32_to_cpu(rm->m_inc.i_hdr.h_len) - 1;
-		smp_mb__before_clear_bit();
+		smp_mb__before_atomic();
 		set_bit(RDS_MSG_HAS_ACK_SEQ, &rm->m_flags);
 		tc->t_last_expected_una = rm->m_ack_seq + 1;
 
@@ -116,12 +117,15 @@ int rds_tcp_xmit(struct rds_connection *conn, struct rds_message *rm,
 			goto out;
 	}
 
+	more = rm->data.op_nents > 1 ? (MSG_MORE | MSG_SENDPAGE_NOTLAST) : 0;
 	while (sg < rm->data.op_nents) {
+		int flags = MSG_DONTWAIT | MSG_NOSIGNAL | more;
+
 		ret = tc->t_sock->ops->sendpage(tc->t_sock,
 						sg_page(&rm->data.op_sg[sg]),
 						rm->data.op_sg[sg].offset + off,
 						rm->data.op_sg[sg].length - off,
-						MSG_DONTWAIT|MSG_NOSIGNAL);
+						flags);
 		rdsdebug("tcp sendpage %p:%u:%u ret %d\n", (void *)sg_page(&rm->data.op_sg[sg]),
 			 rm->data.op_sg[sg].offset + off, rm->data.op_sg[sg].length - off,
 			 ret);
@@ -134,6 +138,8 @@ int rds_tcp_xmit(struct rds_connection *conn, struct rds_message *rm,
 			off = 0;
 			sg++;
 		}
+		if (sg == rm->data.op_nents - 1)
+			more = 0;
 	}
 
 out:
@@ -190,7 +196,7 @@ void rds_tcp_write_space(struct sock *sk)
 	tc->t_last_seen_una = rds_tcp_snd_una(tc);
 	rds_send_drop_acked(conn, rds_tcp_snd_una(tc), rds_tcp_is_acked);
 
-        if ((atomic_read(&sk->sk_wmem_alloc) << 1) <= sk->sk_sndbuf)
+	if ((atomic_read(&sk->sk_wmem_alloc) << 1) <= sk->sk_sndbuf)
 		queue_delayed_work(rds_wq, &conn->c_send_w, 0);
 
 out:

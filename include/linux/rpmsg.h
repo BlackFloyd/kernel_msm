@@ -38,6 +38,8 @@
 #include <linux/types.h>
 #include <linux/device.h>
 #include <linux/mod_devicetable.h>
+#include <linux/kref.h>
+#include <linux/mutex.h>
 
 /* The feature bitmap for virtio rpmsg */
 #define VIRTIO_RPMSG_F_NS	0 /* RP supports name service notifications */
@@ -120,7 +122,9 @@ typedef void (*rpmsg_rx_cb_t)(struct rpmsg_channel *, void *, int, void *, u32);
 /**
  * struct rpmsg_endpoint - binds a local rpmsg address to its user
  * @rpdev: rpmsg channel device
+ * @refcount: when this drops to zero, the ept is deallocated
  * @cb: rx callback handler
+ * @cb_lock: must be taken before accessing/changing @cb
  * @addr: local rpmsg address
  * @priv: private data for the driver's use
  *
@@ -140,7 +144,9 @@ typedef void (*rpmsg_rx_cb_t)(struct rpmsg_channel *, void *, int, void *, u32);
  */
 struct rpmsg_endpoint {
 	struct rpmsg_channel *rpdev;
+	struct kref refcount;
 	rpmsg_rx_cb_t cb;
+	struct mutex cb_lock;
 	u32 addr;
 	void *priv;
 };
@@ -163,13 +169,29 @@ struct rpmsg_driver {
 
 int register_rpmsg_device(struct rpmsg_channel *dev);
 void unregister_rpmsg_device(struct rpmsg_channel *dev);
-int register_rpmsg_driver(struct rpmsg_driver *drv);
+int __register_rpmsg_driver(struct rpmsg_driver *drv, struct module *owner);
 void unregister_rpmsg_driver(struct rpmsg_driver *drv);
 void rpmsg_destroy_ept(struct rpmsg_endpoint *);
 struct rpmsg_endpoint *rpmsg_create_ept(struct rpmsg_channel *,
 				rpmsg_rx_cb_t cb, void *priv, u32 addr);
 int
 rpmsg_send_offchannel_raw(struct rpmsg_channel *, u32, u32, void *, int, bool);
+
+/* use a macro to avoid include chaining to get THIS_MODULE */
+#define register_rpmsg_driver(drv) \
+	__register_rpmsg_driver(drv, THIS_MODULE)
+
+/**
+ * module_rpmsg_driver() - Helper macro for registering an rpmsg driver
+ * @__rpmsg_driver: rpmsg_driver struct
+ *
+ * Helper macro for rpmsg drivers which do not do anything special in module
+ * init/exit. This eliminates a lot of boilerplate.  Each module may only
+ * use this macro once, and calling it replaces module_init() and module_exit()
+ */
+#define module_rpmsg_driver(__rpmsg_driver) \
+	module_driver(__rpmsg_driver, register_rpmsg_driver, \
+			unregister_rpmsg_driver)
 
 /**
  * rpmsg_send() - send a message across to the remote processor

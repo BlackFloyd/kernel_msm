@@ -13,11 +13,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- * Written by Koji Sato <koji@osrg.net>.
+ * Written by Koji Sato.
  */
 
 #include <linux/types.h>
@@ -33,6 +29,12 @@
 #define NILFS_CNO_MIN	((__u64)1)
 #define NILFS_CNO_MAX	(~(__u64)0)
 
+/**
+ * struct nilfs_dat_info - on-memory private data of DAT file
+ * @mi: on-memory private data of metadata file
+ * @palloc_cache: persistent object allocator cache of DAT file
+ * @shadow: shadow map of DAT file
+ */
 struct nilfs_dat_info {
 	struct nilfs_mdt_info mi;
 	struct nilfs_palloc_cache palloc_cache;
@@ -149,7 +151,6 @@ void nilfs_dat_commit_start(struct inode *dat, struct nilfs_palloc_req *req,
 int nilfs_dat_prepare_end(struct inode *dat, struct nilfs_palloc_req *req)
 {
 	struct nilfs_dat_entry *entry;
-	__u64 start;
 	sector_t blocknr;
 	void *kaddr;
 	int ret;
@@ -163,7 +164,6 @@ int nilfs_dat_prepare_end(struct inode *dat, struct nilfs_palloc_req *req)
 	kaddr = kmap_atomic(req->pr_entry_bh->b_page);
 	entry = nilfs_palloc_block_get_entry(dat, req->pr_entry_nr,
 					     req->pr_entry_bh, kaddr);
-	start = le64_to_cpu(entry->de_start);
 	blocknr = le64_to_cpu(entry->de_blocknr);
 	kunmap_atomic(kaddr);
 
@@ -424,7 +424,7 @@ int nilfs_dat_translate(struct inode *dat, __u64 vblocknr, sector_t *blocknrp)
 	return ret;
 }
 
-ssize_t nilfs_dat_get_vinfo(struct inode *dat, void *buf, unsigned visz,
+ssize_t nilfs_dat_get_vinfo(struct inode *dat, void *buf, unsigned int visz,
 			    size_t nvi)
 {
 	struct buffer_head *entry_bh;
@@ -477,6 +477,18 @@ int nilfs_dat_read(struct super_block *sb, size_t entry_size,
 	struct inode *dat;
 	struct nilfs_dat_info *di;
 	int err;
+
+	if (entry_size > sb->s_blocksize) {
+		printk(KERN_ERR
+		       "NILFS: too large DAT entry size: %zu bytes.\n",
+		       entry_size);
+		return -EINVAL;
+	} else if (entry_size < NILFS_MIN_DAT_ENTRY_SIZE) {
+		printk(KERN_ERR
+		       "NILFS: too small DAT entry size: %zu bytes.\n",
+		       entry_size);
+		return -EINVAL;
+	}
 
 	dat = nilfs_iget_locked(sb, NULL, NILFS_DAT_INO);
 	if (unlikely(!dat))

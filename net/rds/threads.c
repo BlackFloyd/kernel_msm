@@ -71,15 +71,14 @@
 struct workqueue_struct *rds_wq;
 EXPORT_SYMBOL_GPL(rds_wq);
 
-void rds_connect_complete(struct rds_connection *conn)
+void rds_connect_path_complete(struct rds_connection *conn, int curr)
 {
-	if (!rds_conn_transition(conn, RDS_CONN_CONNECTING, RDS_CONN_UP)) {
+	if (!rds_conn_transition(conn, curr, RDS_CONN_UP)) {
 		printk(KERN_WARNING "%s: Cannot transition to state UP, "
 				"current state is %d\n",
 				__func__,
 				atomic_read(&conn->c_state));
-		atomic_set(&conn->c_state, RDS_CONN_ERROR);
-		queue_work(rds_wq, &conn->c_down_w);
+		rds_conn_drop(conn);
 		return;
 	}
 
@@ -90,6 +89,12 @@ void rds_connect_complete(struct rds_connection *conn)
 	set_bit(0, &conn->c_map_queued);
 	queue_delayed_work(rds_wq, &conn->c_send_w, 0);
 	queue_delayed_work(rds_wq, &conn->c_recv_w, 0);
+}
+EXPORT_SYMBOL_GPL(rds_connect_path_complete);
+
+void rds_connect_complete(struct rds_connection *conn)
+{
+	rds_connect_path_complete(conn, RDS_CONN_CONNECTING);
 }
 EXPORT_SYMBOL_GPL(rds_connect_complete);
 
@@ -163,7 +168,9 @@ void rds_send_worker(struct work_struct *work)
 	int ret;
 
 	if (rds_conn_state(conn) == RDS_CONN_UP) {
+		clear_bit(RDS_LL_SEND_FULL, &conn->c_flags);
 		ret = rds_send_xmit(conn);
+		cond_resched();
 		rdsdebug("conn %p ret %d\n", conn, ret);
 		switch (ret) {
 		case -EAGAIN:

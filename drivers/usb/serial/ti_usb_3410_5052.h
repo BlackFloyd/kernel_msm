@@ -37,6 +37,7 @@
 #define TI_5152_BOOT_PRODUCT_ID		0x5152	/* no EEPROM, no firmware */
 #define TI_5052_EEPROM_PRODUCT_ID	0x505A	/* EEPROM, no firmware */
 #define TI_5052_FIRMWARE_PRODUCT_ID	0x505F	/* firmware is running */
+#define FRI2_PRODUCT_ID			0x5053  /* Fish River Island II */
 
 /* Multi-Tech vendor and product ids */
 #define MTS_VENDOR_ID			0x06E0
@@ -51,7 +52,21 @@
 
 /* Abbott Diabetics vendor and product ids */
 #define ABBOTT_VENDOR_ID		0x1a61
-#define ABBOTT_PRODUCT_ID		0x3410
+#define ABBOTT_STEREO_PLUG_ID		0x3410
+#define ABBOTT_PRODUCT_ID		ABBOTT_STEREO_PLUG_ID
+#define ABBOTT_STRIP_PORT_ID		0x3420
+
+/* Honeywell vendor and product IDs */
+#define HONEYWELL_VENDOR_ID		0x10ac
+#define HONEYWELL_HGI80_PRODUCT_ID	0x0102  /* Honeywell HGI80 */
+
+/* Moxa UPORT 11x0 vendor and product IDs */
+#define MXU1_VENDOR_ID				0x110a
+#define MXU1_1110_PRODUCT_ID			0x1110
+#define MXU1_1130_PRODUCT_ID			0x1130
+#define MXU1_1131_PRODUCT_ID			0x1131
+#define MXU1_1150_PRODUCT_ID			0x1150
+#define MXU1_1151_PRODUCT_ID			0x1151
 
 /* Commands */
 #define TI_GET_VERSION			0x01

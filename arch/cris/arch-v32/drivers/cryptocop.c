@@ -525,7 +525,7 @@ static int setup_cipher_iv_desc(struct cryptocop_tfrm_ctx *tc, struct cryptocop_
 	return 0;
 }
 
-/* Map the ouput length of the transform to operation output starting on the inject index. */
+/* Map the output length of the transform to operation output starting on the inject index. */
 static int create_input_descriptors(struct cryptocop_operation *operation, struct cryptocop_tfrm_ctx *tc, struct cryptocop_dma_desc **id, int alloc_flag)
 {
 	int                        err = 0;
@@ -1394,11 +1394,10 @@ static int create_md5_pad(int alloc_flag, unsigned long long hashed_length, char
 
 	if (padlen < MD5_MIN_PAD_LENGTH) padlen += MD5_BLOCK_LENGTH;
 
-	p = kmalloc(padlen, alloc_flag);
+	p = kzalloc(padlen, alloc_flag);
 	if (!p) return -ENOMEM;
 
 	*p = 0x80;
-	memset(p+1, 0, padlen - 1);
 
 	DEBUG(printk("create_md5_pad: hashed_length=%lld bits == %lld bytes\n", bit_length, hashed_length));
 
@@ -1426,11 +1425,10 @@ static int create_sha1_pad(int alloc_flag, unsigned long long hashed_length, cha
 
 	if (padlen < SHA1_MIN_PAD_LENGTH) padlen += SHA1_BLOCK_LENGTH;
 
-	p = kmalloc(padlen, alloc_flag);
+	p = kzalloc(padlen, alloc_flag);
 	if (!p) return -ENOMEM;
 
 	*p = 0x80;
-	memset(p+1, 0, padlen - 1);
 
 	DEBUG(printk("create_sha1_pad: hashed_length=%lld bits == %lld bytes\n", bit_length, hashed_length));
 
@@ -2721,9 +2719,7 @@ static int cryptocop_ioctl_process(struct inode *inode, struct file *filp, unsig
 	/* Acquire the mm page semaphore. */
 	down_read(&current->mm->mmap_sem);
 
-	err = get_user_pages(current,
-			     current->mm,
-			     (unsigned long int)(oper.indata + prev_ix),
+	err = get_user_pages((unsigned long int)(oper.indata + prev_ix),
 			     noinpages,
 			     0,  /* read access only for in data */
 			     0, /* no force */
@@ -2738,9 +2734,7 @@ static int cryptocop_ioctl_process(struct inode *inode, struct file *filp, unsig
 	}
 	noinpages = err;
 	if (oper.do_cipher){
-		err = get_user_pages(current,
-				     current->mm,
-				     (unsigned long int)oper.cipher_outdata,
+		err = get_user_pages((unsigned long int)oper.cipher_outdata,
 				     nooutpages,
 				     1, /* write access for out data */
 				     0, /* no force */
@@ -3137,11 +3131,10 @@ static long cryptocop_ioctl_unlocked(struct inode *inode,
 static long
 cryptocop_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-       struct inode *inode = file->f_path.dentry->d_inode;
        long ret;
 
        mutex_lock(&cryptocop_mutex);
-       ret = cryptocop_ioctl_unlocked(inode, filp, cmd, arg);
+       ret = cryptocop_ioctl_unlocked(file_inode(filp), filp, cmd, arg);
        mutex_unlock(&cryptocop_mutex);
 
        return ret;

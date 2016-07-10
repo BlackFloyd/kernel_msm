@@ -19,8 +19,7 @@
 #define MMU_FTR_TYPE_40x		ASM_CONST(0x00000004)
 #define MMU_FTR_TYPE_44x		ASM_CONST(0x00000008)
 #define MMU_FTR_TYPE_FSL_E		ASM_CONST(0x00000010)
-#define MMU_FTR_TYPE_3E			ASM_CONST(0x00000020)
-#define MMU_FTR_TYPE_47x		ASM_CONST(0x00000040)
+#define MMU_FTR_TYPE_47x		ASM_CONST(0x00000020)
 
 /*
  * This is individual features
@@ -65,9 +64,9 @@
  */
 #define MMU_FTR_USE_PAIRED_MAS		ASM_CONST(0x01000000)
 
-/* MMU is SLB-based
+/* Doesn't support the B bit (1T segment) in SLBIE
  */
-#define MMU_FTR_SLB			ASM_CONST(0x02000000)
+#define MMU_FTR_NO_SLBIE_B		ASM_CONST(0x02000000)
 
 /* Support 16M large pages
  */
@@ -89,9 +88,10 @@
  */
 #define MMU_FTR_1T_SEGMENT		ASM_CONST(0x40000000)
 
-/* Doesn't support the B bit (1T segment) in SLBIE
+/*
+ * Radix page table available
  */
-#define MMU_FTR_NO_SLBIE_B		ASM_CONST(0x80000000)
+#define MMU_FTR_RADIX			ASM_CONST(0x80000000)
 
 /* MMU feature bit sets for various CPUs */
 #define MMU_FTRS_DEFAULT_HPTE_ARCH_V2	\
@@ -101,17 +101,12 @@
 #define MMU_FTRS_POWER5		MMU_FTRS_POWER4 | MMU_FTR_LOCKLESS_TLBIE
 #define MMU_FTRS_POWER6		MMU_FTRS_POWER4 | MMU_FTR_LOCKLESS_TLBIE
 #define MMU_FTRS_POWER7		MMU_FTRS_POWER4 | MMU_FTR_LOCKLESS_TLBIE
+#define MMU_FTRS_POWER8		MMU_FTRS_POWER4 | MMU_FTR_LOCKLESS_TLBIE
+#define MMU_FTRS_POWER9		MMU_FTRS_POWER4 | MMU_FTR_LOCKLESS_TLBIE
 #define MMU_FTRS_CELL		MMU_FTRS_DEFAULT_HPTE_ARCH_V2 | \
 				MMU_FTR_CI_LARGE_PAGE
 #define MMU_FTRS_PA6T		MMU_FTRS_DEFAULT_HPTE_ARCH_V2 | \
 				MMU_FTR_CI_LARGE_PAGE | MMU_FTR_NO_SLBIE_B
-#define MMU_FTRS_A2		MMU_FTR_TYPE_3E | MMU_FTR_USE_TLBILX | \
-				MMU_FTR_USE_TLBIVAX_BCAST | \
-				MMU_FTR_LOCK_BCAST_INVAL | \
-				MMU_FTR_USE_TLBRSRV | \
-				MMU_FTR_USE_PAIRED_MAS | \
-				MMU_FTR_TLBIEL | \
-				MMU_FTR_16M_PAGE
 #ifndef __ASSEMBLY__
 #include <asm/cputable.h>
 
@@ -120,9 +115,25 @@
 DECLARE_PER_CPU(int, next_tlbcam_idx);
 #endif
 
+enum {
+	MMU_FTRS_POSSIBLE = MMU_FTR_HPTE_TABLE | MMU_FTR_TYPE_8xx |
+		MMU_FTR_TYPE_40x | MMU_FTR_TYPE_44x | MMU_FTR_TYPE_FSL_E |
+		MMU_FTR_TYPE_47x | MMU_FTR_USE_HIGH_BATS | MMU_FTR_BIG_PHYS |
+		MMU_FTR_USE_TLBIVAX_BCAST | MMU_FTR_USE_TLBILX |
+		MMU_FTR_LOCK_BCAST_INVAL | MMU_FTR_NEED_DTLB_SW_LRU |
+		MMU_FTR_USE_TLBRSRV | MMU_FTR_USE_PAIRED_MAS |
+		MMU_FTR_NO_SLBIE_B | MMU_FTR_16M_PAGE | MMU_FTR_TLBIEL |
+		MMU_FTR_LOCKLESS_TLBIE | MMU_FTR_CI_LARGE_PAGE |
+		MMU_FTR_1T_SEGMENT |
+#ifdef CONFIG_PPC_RADIX_MMU
+		MMU_FTR_RADIX |
+#endif
+		0,
+};
+
 static inline int mmu_has_feature(unsigned long feature)
 {
-	return (cur_cpu_spec->mmu_features & feature);
+	return (MMU_FTRS_POSSIBLE & cur_cpu_spec->mmu_features & feature);
 }
 
 static inline void mmu_clear_feature(unsigned long feature)
@@ -132,19 +143,21 @@ static inline void mmu_clear_feature(unsigned long feature)
 
 extern unsigned int __start___mmu_ftr_fixup, __stop___mmu_ftr_fixup;
 
-/* MMU initialization */
-extern void early_init_mmu(void);
-extern void early_init_mmu_secondary(void);
-
-extern void setup_initial_memory_limit(phys_addr_t first_memblock_base,
-				       phys_addr_t first_memblock_size);
-
 #ifdef CONFIG_PPC64
 /* This is our real memory area size on ppc64 server, on embedded, we
  * make it match the size our of bolted TLB area
  */
 extern u64 ppc64_rma_size;
 #endif /* CONFIG_PPC64 */
+
+struct mm_struct;
+#ifdef CONFIG_DEBUG_VM
+extern void assert_pte_locked(struct mm_struct *mm, unsigned long addr);
+#else /* CONFIG_DEBUG_VM */
+static inline void assert_pte_locked(struct mm_struct *mm, unsigned long addr)
+{
+}
+#endif /* !CONFIG_DEBUG_VM */
 
 #endif /* !__ASSEMBLY__ */
 
@@ -163,35 +176,41 @@ extern u64 ppc64_rma_size;
  * to think about, feedback welcome. --BenH.
  */
 
-/* There are #define as they have to be used in assembly
- *
- * WARNING: If you change this list, make sure to update the array of
- * names currently in arch/powerpc/mm/hugetlbpage.c or bad things will
- * happen
- */
+/* These are #defines as they have to be used in assembly */
 #define MMU_PAGE_4K	0
 #define MMU_PAGE_16K	1
 #define MMU_PAGE_64K	2
 #define MMU_PAGE_64K_AP	3	/* "Admixed pages" (hash64 only) */
 #define MMU_PAGE_256K	4
 #define MMU_PAGE_1M	5
-#define MMU_PAGE_4M	6
-#define MMU_PAGE_8M	7
-#define MMU_PAGE_16M	8
-#define MMU_PAGE_64M	9
-#define MMU_PAGE_256M	10
-#define MMU_PAGE_1G	11
-#define MMU_PAGE_16G	12
-#define MMU_PAGE_64G	13
+#define MMU_PAGE_2M	6
+#define MMU_PAGE_4M	7
+#define MMU_PAGE_8M	8
+#define MMU_PAGE_16M	9
+#define MMU_PAGE_64M	10
+#define MMU_PAGE_256M	11
+#define MMU_PAGE_1G	12
+#define MMU_PAGE_16G	13
+#define MMU_PAGE_64G	14
 
-#define MMU_PAGE_COUNT	14
+#define MMU_PAGE_COUNT	15
 
-#if defined(CONFIG_PPC_STD_MMU_64)
-/* 64-bit classic hash table MMU */
-#  include <asm/mmu-hash64.h>
-#elif defined(CONFIG_PPC_STD_MMU_32)
+#ifdef CONFIG_PPC_BOOK3S_64
+#include <asm/book3s/64/mmu.h>
+#else /* CONFIG_PPC_BOOK3S_64 */
+
+#ifndef __ASSEMBLY__
+/* MMU initialization */
+extern void early_init_mmu(void);
+extern void early_init_mmu_secondary(void);
+extern void setup_initial_memory_limit(phys_addr_t first_memblock_base,
+				       phys_addr_t first_memblock_size);
+#endif /* __ASSEMBLY__ */
+#endif
+
+#if defined(CONFIG_PPC_STD_MMU_32)
 /* 32-bit classic hash table MMU */
-#  include <asm/mmu-hash32.h>
+#include <asm/book3s/32/mmu-hash.h>
 #elif defined(CONFIG_40x)
 /* 40x-style software loaded TLB */
 #  include <asm/mmu-40x.h>
@@ -206,6 +225,9 @@ extern u64 ppc64_rma_size;
 #  include <asm/mmu-8xx.h>
 #endif
 
+#ifndef radix_enabled
+#define radix_enabled() (0)
+#endif
 
 #endif /* __KERNEL__ */
 #endif /* _ASM_POWERPC_MMU_H_ */

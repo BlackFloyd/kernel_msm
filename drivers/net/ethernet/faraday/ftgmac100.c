@@ -24,7 +24,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
-#include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -72,8 +71,6 @@ struct ftgmac100 {
 	struct napi_struct napi;
 
 	struct mii_bus *mii_bus;
-	int phy_irq[PHY_MAX_ADDR];
-	struct phy_device *phydev;
 	int old_speed;
 };
 
@@ -479,9 +476,14 @@ static bool ftgmac100_rx_packet(struct ftgmac100 *priv, int *processed)
 		rxdes = ftgmac100_current_rxdes(priv);
 	} while (!done);
 
-	if (skb->len <= 64)
+	/* Small frames are copied into linear part of skb to free one page */
+	if (skb->len <= 128) {
 		skb->truesize -= PAGE_SIZE;
-	__pskb_pull_tail(skb, min(skb->len, 64U));
+		__pskb_pull_tail(skb, skb->len);
+	} else {
+		/* We pull the minimum amount into linear part */
+		__pskb_pull_tail(skb, ETH_HLEN);
+	}
 	skb->protocol = eth_type_trans(skb, netdev);
 
 	netdev->stats.rx_packets++;
@@ -762,7 +764,7 @@ static void ftgmac100_free_buffers(struct ftgmac100 *priv)
 			continue;
 
 		dma_unmap_single(priv->dev, map, skb_headlen(skb), DMA_TO_DEVICE);
-		dev_kfree_skb(skb);
+		kfree_skb(skb);
 	}
 
 	dma_free_coherent(priv->dev, sizeof(struct ftgmac100_descs),
@@ -773,13 +775,11 @@ static int ftgmac100_alloc_buffers(struct ftgmac100 *priv)
 {
 	int i;
 
-	priv->descs = dma_alloc_coherent(priv->dev,
-					 sizeof(struct ftgmac100_descs),
-					 &priv->descs_dma_addr, GFP_KERNEL);
+	priv->descs = dma_zalloc_coherent(priv->dev,
+					  sizeof(struct ftgmac100_descs),
+					  &priv->descs_dma_addr, GFP_KERNEL);
 	if (!priv->descs)
 		return -ENOMEM;
-
-	memset(priv->descs, 0, sizeof(struct ftgmac100_descs));
 
 	/* initialize RX ring */
 	ftgmac100_rxdes_set_end_of_ring(&priv->descs->rxdes[RX_QUEUE_ENTRIES - 1]);
@@ -806,7 +806,7 @@ err:
 static void ftgmac100_adjust_link(struct net_device *netdev)
 {
 	struct ftgmac100 *priv = netdev_priv(netdev);
-	struct phy_device *phydev = priv->phydev;
+	struct phy_device *phydev = netdev->phydev;
 	int ier;
 
 	if (phydev->speed == priv->old_speed)
@@ -833,35 +833,22 @@ static void ftgmac100_adjust_link(struct net_device *netdev)
 static int ftgmac100_mii_probe(struct ftgmac100 *priv)
 {
 	struct net_device *netdev = priv->netdev;
-	struct phy_device *phydev = NULL;
-	int i;
+	struct phy_device *phydev;
 
-	/* search for connect PHY device */
-	for (i = 0; i < PHY_MAX_ADDR; i++) {
-		struct phy_device *tmp = priv->mii_bus->phy_map[i];
-
-		if (tmp) {
-			phydev = tmp;
-			break;
-		}
-	}
-
-	/* now we are supposed to have a proper phydev, to attach to... */
+	phydev = phy_find_first(priv->mii_bus);
 	if (!phydev) {
 		netdev_info(netdev, "%s: no PHY found\n", netdev->name);
 		return -ENODEV;
 	}
 
-	phydev = phy_connect(netdev, dev_name(&phydev->dev),
-			     &ftgmac100_adjust_link, 0,
-			     PHY_INTERFACE_MODE_GMII);
+	phydev = phy_connect(netdev, phydev_name(phydev),
+			     &ftgmac100_adjust_link, PHY_INTERFACE_MODE_GMII);
 
 	if (IS_ERR(phydev)) {
 		netdev_err(netdev, "%s: Could not attach to PHY\n", netdev->name);
 		return PTR_ERR(phydev);
 	}
 
-	priv->phydev = phydev;
 	return 0;
 }
 
@@ -939,43 +926,22 @@ static int ftgmac100_mdiobus_write(struct mii_bus *bus, int phy_addr,
 	return -EIO;
 }
 
-static int ftgmac100_mdiobus_reset(struct mii_bus *bus)
-{
-	return 0;
-}
-
 /******************************************************************************
  * struct ethtool_ops functions
  *****************************************************************************/
 static void ftgmac100_get_drvinfo(struct net_device *netdev,
 				  struct ethtool_drvinfo *info)
 {
-	strcpy(info->driver, DRV_NAME);
-	strcpy(info->version, DRV_VERSION);
-	strcpy(info->bus_info, dev_name(&netdev->dev));
-}
-
-static int ftgmac100_get_settings(struct net_device *netdev,
-				  struct ethtool_cmd *cmd)
-{
-	struct ftgmac100 *priv = netdev_priv(netdev);
-
-	return phy_ethtool_gset(priv->phydev, cmd);
-}
-
-static int ftgmac100_set_settings(struct net_device *netdev,
-				  struct ethtool_cmd *cmd)
-{
-	struct ftgmac100 *priv = netdev_priv(netdev);
-
-	return phy_ethtool_sset(priv->phydev, cmd);
+	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
+	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
+	strlcpy(info->bus_info, dev_name(&netdev->dev), sizeof(info->bus_info));
 }
 
 static const struct ethtool_ops ftgmac100_ethtool_ops = {
-	.set_settings		= ftgmac100_set_settings,
-	.get_settings		= ftgmac100_get_settings,
 	.get_drvinfo		= ftgmac100_get_drvinfo,
 	.get_link		= ethtool_op_get_link,
+	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
+	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
 };
 
 /******************************************************************************
@@ -1101,7 +1067,7 @@ static int ftgmac100_open(struct net_device *netdev)
 	ftgmac100_init_hw(priv);
 	ftgmac100_start_hw(priv, 10);
 
-	phy_start(priv->phydev);
+	phy_start(netdev->phydev);
 
 	napi_enable(&priv->napi);
 	netif_start_queue(netdev);
@@ -1127,7 +1093,7 @@ static int ftgmac100_stop(struct net_device *netdev)
 
 	netif_stop_queue(netdev);
 	napi_disable(&priv->napi);
-	phy_stop(priv->phydev);
+	phy_stop(netdev->phydev);
 
 	ftgmac100_stop_hw(priv);
 	free_irq(priv->irq, netdev);
@@ -1147,7 +1113,7 @@ static int ftgmac100_hard_start_xmit(struct sk_buff *skb,
 			netdev_dbg(netdev, "tx packet too big\n");
 
 		netdev->stats.tx_dropped++;
-		dev_kfree_skb(skb);
+		kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
@@ -1158,7 +1124,7 @@ static int ftgmac100_hard_start_xmit(struct sk_buff *skb,
 			netdev_err(netdev, "map socket buffer failed\n");
 
 		netdev->stats.tx_dropped++;
-		dev_kfree_skb(skb);
+		kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
@@ -1168,9 +1134,7 @@ static int ftgmac100_hard_start_xmit(struct sk_buff *skb,
 /* optional */
 static int ftgmac100_do_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 {
-	struct ftgmac100 *priv = netdev_priv(netdev);
-
-	return phy_mii_ioctl(priv->phydev, ifr, cmd);
+	return phy_mii_ioctl(netdev->phydev, ifr, cmd);
 }
 
 static const struct net_device_ops ftgmac100_netdev_ops = {
@@ -1192,7 +1156,6 @@ static int ftgmac100_probe(struct platform_device *pdev)
 	struct net_device *netdev;
 	struct ftgmac100 *priv;
 	int err;
-	int i;
 
 	if (!pdev)
 		return -ENODEV;
@@ -1214,7 +1177,7 @@ static int ftgmac100_probe(struct platform_device *pdev)
 
 	SET_NETDEV_DEV(netdev, &pdev->dev);
 
-	SET_ETHTOOL_OPS(netdev, &ftgmac100_ethtool_ops);
+	netdev->ethtool_ops = &ftgmac100_ethtool_ops;
 	netdev->netdev_ops = &ftgmac100_netdev_ops;
 	netdev->features = NETIF_F_IP_CSUM | NETIF_F_GRO;
 
@@ -1261,11 +1224,6 @@ static int ftgmac100_probe(struct platform_device *pdev)
 	priv->mii_bus->priv = netdev;
 	priv->mii_bus->read = ftgmac100_mdiobus_read;
 	priv->mii_bus->write = ftgmac100_mdiobus_write;
-	priv->mii_bus->reset = ftgmac100_mdiobus_reset;
-	priv->mii_bus->irq = priv->phy_irq;
-
-	for (i = 0; i < PHY_MAX_ADDR; i++)
-		priv->mii_bus->irq[i] = PHY_POLL;
 
 	err = mdiobus_register(priv->mii_bus);
 	if (err) {
@@ -1297,7 +1255,7 @@ static int ftgmac100_probe(struct platform_device *pdev)
 	return 0;
 
 err_register_netdev:
-	phy_disconnect(priv->phydev);
+	phy_disconnect(netdev->phydev);
 err_mii_probe:
 	mdiobus_unregister(priv->mii_bus);
 err_register_mdiobus:
@@ -1308,7 +1266,6 @@ err_ioremap:
 	release_resource(priv->res);
 err_req_mem:
 	netif_napi_del(&priv->napi);
-	platform_set_drvdata(pdev, NULL);
 	free_netdev(netdev);
 err_alloc_etherdev:
 	return err;
@@ -1324,7 +1281,7 @@ static int __exit ftgmac100_remove(struct platform_device *pdev)
 
 	unregister_netdev(netdev);
 
-	phy_disconnect(priv->phydev);
+	phy_disconnect(netdev->phydev);
 	mdiobus_unregister(priv->mii_bus);
 	mdiobus_free(priv->mii_bus);
 
@@ -1332,7 +1289,6 @@ static int __exit ftgmac100_remove(struct platform_device *pdev)
 	release_resource(priv->res);
 
 	netif_napi_del(&priv->napi);
-	platform_set_drvdata(pdev, NULL);
 	free_netdev(netdev);
 	return 0;
 }
@@ -1342,26 +1298,10 @@ static struct platform_driver ftgmac100_driver = {
 	.remove		= __exit_p(ftgmac100_remove),
 	.driver		= {
 		.name	= DRV_NAME,
-		.owner	= THIS_MODULE,
 	},
 };
 
-/******************************************************************************
- * initialization / finalization
- *****************************************************************************/
-static int __init ftgmac100_init(void)
-{
-	pr_info("Loading version " DRV_VERSION " ...\n");
-	return platform_driver_register(&ftgmac100_driver);
-}
-
-static void __exit ftgmac100_exit(void)
-{
-	platform_driver_unregister(&ftgmac100_driver);
-}
-
-module_init(ftgmac100_init);
-module_exit(ftgmac100_exit);
+module_platform_driver(ftgmac100_driver);
 
 MODULE_AUTHOR("Po-Yu Chuang <ratbert@faraday-tech.com>");
 MODULE_DESCRIPTION("FTGMAC100 driver");

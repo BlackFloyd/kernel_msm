@@ -25,26 +25,31 @@ unsigned int code_bytes = 64;
 int kstack_depth_to_print = 3 * STACKSLOTS_PER_LINE;
 static int die_counter;
 
-void printk_address(unsigned long address, int reliable)
+static void printk_stack_address(unsigned long address, int reliable,
+		void *data)
 {
-	printk(" [<%p>] %s%pB\n", (void *) address,
-			reliable ? "" : "? ", (void *) address);
+	printk("%s [<%p>] %s%pB\n",
+		(char *)data, (void *)address, reliable ? "" : "? ",
+		(void *)address);
+}
+
+void printk_address(unsigned long address)
+{
+	pr_cont(" [<%p>] %pS\n", (void *)address, (void *)address);
 }
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 static void
 print_ftrace_graph_addr(unsigned long addr, void *data,
 			const struct stacktrace_ops *ops,
-			struct thread_info *tinfo, int *graph)
+			struct task_struct *task, int *graph)
 {
-	struct task_struct *task;
 	unsigned long ret_addr;
 	int index;
 
 	if (addr != (unsigned long)return_to_handler)
 		return;
 
-	task = tinfo->task;
 	index = task->curr_ret_stack;
 
 	if (!task->ret_stack || index < *graph)
@@ -61,7 +66,7 @@ print_ftrace_graph_addr(unsigned long addr, void *data,
 static inline void
 print_ftrace_graph_addr(unsigned long addr, void *data,
 			const struct stacktrace_ops *ops,
-			struct thread_info *tinfo, int *graph)
+			struct task_struct *task, int *graph)
 { }
 #endif
 
@@ -72,10 +77,10 @@ print_ftrace_graph_addr(unsigned long addr, void *data,
  * severe exception (double fault, nmi, stack fault, debug, mce) hardware stack
  */
 
-static inline int valid_stack_ptr(struct thread_info *tinfo,
+static inline int valid_stack_ptr(struct task_struct *task,
 			void *p, unsigned int size, void *end)
 {
-	void *t = tinfo;
+	void *t = task_stack_page(task);
 	if (end) {
 		if (p < end && p >= (end-THREAD_SIZE))
 			return 1;
@@ -86,14 +91,14 @@ static inline int valid_stack_ptr(struct thread_info *tinfo,
 }
 
 unsigned long
-print_context_stack(struct thread_info *tinfo,
+print_context_stack(struct task_struct *task,
 		unsigned long *stack, unsigned long bp,
 		const struct stacktrace_ops *ops, void *data,
 		unsigned long *end, int *graph)
 {
 	struct stack_frame *frame = (struct stack_frame *)bp;
 
-	while (valid_stack_ptr(tinfo, stack, sizeof(*stack), end)) {
+	while (valid_stack_ptr(task, stack, sizeof(*stack), end)) {
 		unsigned long addr;
 
 		addr = *stack;
@@ -105,7 +110,7 @@ print_context_stack(struct thread_info *tinfo,
 			} else {
 				ops->address(data, addr, 0);
 			}
-			print_ftrace_graph_addr(addr, data, ops, tinfo, graph);
+			print_ftrace_graph_addr(addr, data, ops, task, graph);
 		}
 		stack++;
 	}
@@ -114,7 +119,7 @@ print_context_stack(struct thread_info *tinfo,
 EXPORT_SYMBOL_GPL(print_context_stack);
 
 unsigned long
-print_context_stack_bp(struct thread_info *tinfo,
+print_context_stack_bp(struct task_struct *task,
 		       unsigned long *stack, unsigned long bp,
 		       const struct stacktrace_ops *ops, void *data,
 		       unsigned long *end, int *graph)
@@ -122,16 +127,17 @@ print_context_stack_bp(struct thread_info *tinfo,
 	struct stack_frame *frame = (struct stack_frame *)bp;
 	unsigned long *ret_addr = &frame->return_address;
 
-	while (valid_stack_ptr(tinfo, ret_addr, sizeof(*ret_addr), end)) {
+	while (valid_stack_ptr(task, ret_addr, sizeof(*ret_addr), end)) {
 		unsigned long addr = *ret_addr;
 
 		if (!__kernel_text_address(addr))
 			break;
 
-		ops->address(data, addr, 1);
+		if (ops->address(data, addr, 1))
+			break;
 		frame = frame->next_frame;
 		ret_addr = &frame->return_address;
-		print_ftrace_graph_addr(addr, data, ops, tinfo, graph);
+		print_ftrace_graph_addr(addr, data, ops, task, graph);
 	}
 
 	return (unsigned long)frame;
@@ -147,11 +153,11 @@ static int print_trace_stack(void *data, char *name)
 /*
  * Print one address/symbol entries per line.
  */
-static void print_trace_address(void *data, unsigned long addr, int reliable)
+static int print_trace_address(void *data, unsigned long addr, int reliable)
 {
 	touch_nmi_watchdog();
-	printk(data);
-	printk_address(addr, reliable);
+	printk_stack_address(addr, reliable, data);
+	return 0;
 }
 
 static const struct stacktrace_ops print_trace_ops = {
@@ -176,32 +182,26 @@ void show_trace(struct task_struct *task, struct pt_regs *regs,
 
 void show_stack(struct task_struct *task, unsigned long *sp)
 {
-	show_stack_log_lvl(task, NULL, sp, 0, "");
-}
-
-/*
- * The architecture-independent dump_stack generator
- */
-void dump_stack(void)
-{
-	unsigned long bp;
+	unsigned long bp = 0;
 	unsigned long stack;
 
-	bp = stack_frame(current, NULL);
-	printk("Pid: %d, comm: %.20s %s %s %.*s\n",
-		current->pid, current->comm, print_tainted(),
-		init_utsname()->release,
-		(int)strcspn(init_utsname()->version, " "),
-		init_utsname()->version);
-	show_trace(NULL, NULL, &stack, bp);
+	/*
+	 * Stack frames below this one aren't interesting.  Don't show them
+	 * if we're printing for %current.
+	 */
+	if (!sp && (!task || task == current)) {
+		sp = &stack;
+		bp = stack_frame(current, NULL);
+	}
+
+	show_stack_log_lvl(task, NULL, sp, bp, "");
 }
-EXPORT_SYMBOL(dump_stack);
 
 static arch_spinlock_t die_lock = __ARCH_SPIN_LOCK_UNLOCKED;
 static int die_owner = -1;
 static unsigned int die_nest_count;
 
-unsigned __kprobes long oops_begin(void)
+unsigned long oops_begin(void)
 {
 	int cpu;
 	unsigned long flags;
@@ -224,15 +224,16 @@ unsigned __kprobes long oops_begin(void)
 	return flags;
 }
 EXPORT_SYMBOL_GPL(oops_begin);
+NOKPROBE_SYMBOL(oops_begin);
 
-void __kprobes oops_end(unsigned long flags, struct pt_regs *regs, int signr)
+void oops_end(unsigned long flags, struct pt_regs *regs, int signr)
 {
 	if (regs && kexec_should_crash(current))
 		crash_kexec(regs);
 
 	bust_spinlocks(0);
 	die_owner = -1;
-	add_taint(TAINT_DIE);
+	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
 	die_nest_count--;
 	if (!die_nest_count)
 		/* Nest count reaches zero, release the lock. */
@@ -248,32 +249,29 @@ void __kprobes oops_end(unsigned long flags, struct pt_regs *regs, int signr)
 		panic("Fatal exception");
 	do_exit(signr);
 }
+NOKPROBE_SYMBOL(oops_end);
 
-int __kprobes __die(const char *str, struct pt_regs *regs, long err)
+int __die(const char *str, struct pt_regs *regs, long err)
 {
 #ifdef CONFIG_X86_32
 	unsigned short ss;
 	unsigned long sp;
 #endif
 	printk(KERN_DEFAULT
-	       "%s: %04lx [#%d] ", str, err & 0xffff, ++die_counter);
-#ifdef CONFIG_PREEMPT
-	printk("PREEMPT ");
-#endif
-#ifdef CONFIG_SMP
-	printk("SMP ");
-#endif
-#ifdef CONFIG_DEBUG_PAGEALLOC
-	printk("DEBUG_PAGEALLOC");
-#endif
-	printk("\n");
+	       "%s: %04lx [#%d]%s%s%s%s\n", str, err & 0xffff, ++die_counter,
+	       IS_ENABLED(CONFIG_PREEMPT) ? " PREEMPT"         : "",
+	       IS_ENABLED(CONFIG_SMP)     ? " SMP"             : "",
+	       debug_pagealloc_enabled()  ? " DEBUG_PAGEALLOC" : "",
+	       IS_ENABLED(CONFIG_KASAN)   ? " KASAN"           : "");
+
 	if (notify_die(DIE_OOPS, str, regs, err,
 			current->thread.trap_nr, SIGSEGV) == NOTIFY_STOP)
 		return 1;
 
-	show_registers(regs);
+	print_modules();
+	show_regs(regs);
 #ifdef CONFIG_X86_32
-	if (user_mode_vm(regs)) {
+	if (user_mode(regs)) {
 		sp = regs->sp;
 		ss = regs->ss & 0xffff;
 	} else {
@@ -286,11 +284,12 @@ int __kprobes __die(const char *str, struct pt_regs *regs, long err)
 #else
 	/* Executive summary in case the oops scrolled away */
 	printk(KERN_ALERT "RIP ");
-	printk_address(regs->ip, 1);
+	printk_address(regs->ip);
 	printk(" RSP <%016lx>\n", regs->sp);
 #endif
 	return 0;
 }
+NOKPROBE_SYMBOL(__die);
 
 /*
  * This is gone through when something in the kernel has done something bad
@@ -301,7 +300,7 @@ void die(const char *str, struct pt_regs *regs, long err)
 	unsigned long flags = oops_begin();
 	int sig = SIGSEGV;
 
-	if (!user_mode_vm(regs))
+	if (!user_mode(regs))
 		report_bug(regs->ip, regs);
 
 	if (__die(str, regs, err))
@@ -311,16 +310,33 @@ void die(const char *str, struct pt_regs *regs, long err)
 
 static int __init kstack_setup(char *s)
 {
+	ssize_t ret;
+	unsigned long val;
+
 	if (!s)
 		return -EINVAL;
-	kstack_depth_to_print = simple_strtoul(s, NULL, 0);
+
+	ret = kstrtoul(s, 0, &val);
+	if (ret)
+		return ret;
+	kstack_depth_to_print = val;
 	return 0;
 }
 early_param("kstack", kstack_setup);
 
 static int __init code_bytes_setup(char *s)
 {
-	code_bytes = simple_strtoul(s, NULL, 0);
+	ssize_t ret;
+	unsigned long val;
+
+	if (!s)
+		return -EINVAL;
+
+	ret = kstrtoul(s, 0, &val);
+	if (ret)
+		return ret;
+
+	code_bytes = val;
 	if (code_bytes > 8192)
 		code_bytes = 8192;
 

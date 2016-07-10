@@ -40,6 +40,7 @@ SECTIONS
 	_stext = .;
 	__stext = .;
 	.text : {
+		HEAD_TEXT
 		TEXT_TEXT
 		SCHED_TEXT
 		LOCK_TEXT
@@ -52,6 +53,7 @@ SECTIONS
 
 	EXCEPTION_TABLE(4)
 
+	_sdata = .;
 	RODATA
 
 	. = ALIGN (4);

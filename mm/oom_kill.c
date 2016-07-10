@@ -35,6 +35,11 @@
 #include <linux/freezer.h>
 #include <linux/ftrace.h>
 #include <linux/ratelimit.h>
+#include <linux/kthread.h>
+#include <linux/init.h>
+
+#include <asm/tlb.h>
+#include "internal.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/oom.h>
@@ -42,66 +47,27 @@
 int sysctl_panic_on_oom;
 int sysctl_oom_kill_allocating_task;
 int sysctl_oom_dump_tasks = 1;
-static DEFINE_SPINLOCK(zone_scan_lock);
 
-/*
- * compare_swap_oom_score_adj() - compare and swap current's oom_score_adj
- * @old_val: old oom_score_adj for compare
- * @new_val: new oom_score_adj for swap
- *
- * Sets the oom_score_adj value for current to @new_val iff its present value is
- * @old_val.  Usually used to reinstate a previous value to prevent racing with
- * userspacing tuning the value in the interim.
- */
-void compare_swap_oom_score_adj(int old_val, int new_val)
-{
-	struct sighand_struct *sighand = current->sighand;
-
-	spin_lock_irq(&sighand->siglock);
-	if (current->signal->oom_score_adj == old_val)
-		current->signal->oom_score_adj = new_val;
-	trace_oom_score_adj_update(current);
-	spin_unlock_irq(&sighand->siglock);
-}
-
-/**
- * test_set_oom_score_adj() - set current's oom_score_adj and return old value
- * @new_val: new oom_score_adj value
- *
- * Sets the oom_score_adj value for current to @new_val with proper
- * synchronization and returns the old value.  Usually used to temporarily
- * set a value, save the old value in the caller, and then reinstate it later.
- */
-int test_set_oom_score_adj(int new_val)
-{
-	struct sighand_struct *sighand = current->sighand;
-	int old_val;
-
-	spin_lock_irq(&sighand->siglock);
-	old_val = current->signal->oom_score_adj;
-	current->signal->oom_score_adj = new_val;
-	trace_oom_score_adj_update(current);
-	spin_unlock_irq(&sighand->siglock);
-
-	return old_val;
-}
+DEFINE_MUTEX(oom_lock);
 
 #ifdef CONFIG_NUMA
 /**
  * has_intersects_mems_allowed() - check task eligiblity for kill
- * @tsk: task struct of which task to consider
+ * @start: task struct of which task to consider
  * @mask: nodemask passed to page allocator for mempolicy ooms
  *
  * Task eligibility is determined by whether or not a candidate task, @tsk,
  * shares the same mempolicy nodes as current if it is bound by such a policy
  * and whether or not it has the same set of allowed cpuset nodes.
  */
-static bool has_intersects_mems_allowed(struct task_struct *tsk,
+static bool has_intersects_mems_allowed(struct task_struct *start,
 					const nodemask_t *mask)
 {
-	struct task_struct *start = tsk;
+	struct task_struct *tsk;
+	bool ret = false;
 
-	do {
+	rcu_read_lock();
+	for_each_thread(start, tsk) {
 		if (mask) {
 			/*
 			 * If this is a mempolicy constrained oom, tsk's
@@ -109,19 +75,20 @@ static bool has_intersects_mems_allowed(struct task_struct *tsk,
 			 * mempolicy intersects current, otherwise it may be
 			 * needlessly killed.
 			 */
-			if (mempolicy_nodemask_intersects(tsk, mask))
-				return true;
+			ret = mempolicy_nodemask_intersects(tsk, mask);
 		} else {
 			/*
 			 * This is not a mempolicy constrained oom, so only
 			 * check the mems of tsk's cpuset.
 			 */
-			if (cpuset_mems_allowed_intersects(current, tsk))
-				return true;
+			ret = cpuset_mems_allowed_intersects(current, tsk);
 		}
-	} while_each_thread(start, tsk);
+		if (ret)
+			break;
+	}
+	rcu_read_unlock();
 
-	return false;
+	return ret;
 }
 #else
 static bool has_intersects_mems_allowed(struct task_struct *tsk,
@@ -139,21 +106,35 @@ static bool has_intersects_mems_allowed(struct task_struct *tsk,
  */
 struct task_struct *find_lock_task_mm(struct task_struct *p)
 {
-	struct task_struct *t = p;
+	struct task_struct *t;
 
-	do {
+	rcu_read_lock();
+
+	for_each_thread(p, t) {
 		task_lock(t);
 		if (likely(t->mm))
-			return t;
+			goto found;
 		task_unlock(t);
-	} while_each_thread(p, t);
+	}
+	t = NULL;
+found:
+	rcu_read_unlock();
 
-	return NULL;
+	return t;
+}
+
+/*
+ * order == -1 means the oom kill is required by sysrq, otherwise only
+ * for display purposes.
+ */
+static inline bool is_sysrq_oom(struct oom_control *oc)
+{
+	return oc->order == -1;
 }
 
 /* return true if the task is not adequate as candidate victim task. */
 static bool oom_unkillable_task(struct task_struct *p,
-		const struct mem_cgroup *memcg, const nodemask_t *nodemask)
+		struct mem_cgroup *memcg, const nodemask_t *nodemask)
 {
 	if (is_global_init(p))
 		return true;
@@ -180,10 +161,11 @@ static bool oom_unkillable_task(struct task_struct *p,
  * predictable as possible.  The goal is to return the highest value for the
  * task consuming the most memory to avoid subsequent oom failures.
  */
-unsigned int oom_badness(struct task_struct *p, struct mem_cgroup *memcg,
-		      const nodemask_t *nodemask, unsigned long totalpages)
+unsigned long oom_badness(struct task_struct *p, struct mem_cgroup *memcg,
+			  const nodemask_t *nodemask, unsigned long totalpages)
 {
 	long points;
+	long adj;
 
 	if (oom_unkillable_task(p, memcg, nodemask))
 		return 0;
@@ -192,27 +174,23 @@ unsigned int oom_badness(struct task_struct *p, struct mem_cgroup *memcg,
 	if (!p)
 		return 0;
 
-	if (p->signal->oom_score_adj == OOM_SCORE_ADJ_MIN) {
+	/*
+	 * Do not even consider tasks which are explicitly marked oom
+	 * unkillable or have been already oom reaped.
+	 */
+	adj = (long)p->signal->oom_score_adj;
+	if (adj == OOM_SCORE_ADJ_MIN ||
+			test_bit(MMF_OOM_REAPED, &p->mm->flags)) {
 		task_unlock(p);
 		return 0;
 	}
 
 	/*
-	 * The memory controller may have a limit of 0 bytes, so avoid a divide
-	 * by zero, if necessary.
-	 */
-	if (!totalpages)
-		totalpages = 1;
-
-	/*
 	 * The baseline for the badness score is the proportion of RAM that each
 	 * task's rss, pagetable and swap space use.
 	 */
-	points = get_mm_rss(p->mm) + p->mm->nr_ptes;
-	points += get_mm_counter(p->mm, MM_SWAPENTS);
-
-	points *= 1000;
-	points /= totalpages;
+	points = get_mm_rss(p->mm) + get_mm_counter(p->mm, MM_SWAPENTS) +
+		atomic_long_read(&p->mm->nr_ptes) + mm_nr_pmds(p->mm);
 	task_unlock(p);
 
 	/*
@@ -220,50 +198,43 @@ unsigned int oom_badness(struct task_struct *p, struct mem_cgroup *memcg,
 	 * implementation used by LSMs.
 	 */
 	if (has_capability_noaudit(p, CAP_SYS_ADMIN))
-		points -= 30;
+		points -= (points * 3) / 100;
+
+	/* Normalize to oom_score_adj units */
+	adj *= totalpages / 1000;
+	points += adj;
 
 	/*
-	 * /proc/pid/oom_score_adj ranges from -1000 to +1000 such that it may
-	 * either completely disable oom killing or always prefer a certain
-	 * task.
+	 * Never return 0 for an eligible task regardless of the root bonus and
+	 * oom_score_adj (oom_score_adj can't be OOM_SCORE_ADJ_MIN here).
 	 */
-	points += p->signal->oom_score_adj;
-
-	/*
-	 * Never return 0 for an eligible task that may be killed since it's
-	 * possible that no single user task uses more than 0.1% of memory and
-	 * no single admin tasks uses more than 3.0%.
-	 */
-	if (points <= 0)
-		return 1;
-	return (points < 1000) ? points : 1000;
+	return points > 0 ? points : 1;
 }
 
 /*
  * Determine the type of allocation constraint.
  */
 #ifdef CONFIG_NUMA
-static enum oom_constraint constrained_alloc(struct zonelist *zonelist,
-				gfp_t gfp_mask, nodemask_t *nodemask,
-				unsigned long *totalpages)
+static enum oom_constraint constrained_alloc(struct oom_control *oc,
+					     unsigned long *totalpages)
 {
 	struct zone *zone;
 	struct zoneref *z;
-	enum zone_type high_zoneidx = gfp_zone(gfp_mask);
+	enum zone_type high_zoneidx = gfp_zone(oc->gfp_mask);
 	bool cpuset_limited = false;
 	int nid;
 
 	/* Default to all available memory */
 	*totalpages = totalram_pages + total_swap_pages;
 
-	if (!zonelist)
+	if (!oc->zonelist)
 		return CONSTRAINT_NONE;
 	/*
 	 * Reach here only when __GFP_NOFAIL is used. So, we should avoid
 	 * to kill current.We have to random task kill in this case.
 	 * Hopefully, CONSTRAINT_THISNODE...but no way to handle it, now.
 	 */
-	if (gfp_mask & __GFP_THISNODE)
+	if (oc->gfp_mask & __GFP_THISNODE)
 		return CONSTRAINT_NONE;
 
 	/*
@@ -271,17 +242,18 @@ static enum oom_constraint constrained_alloc(struct zonelist *zonelist,
 	 * the page allocator means a mempolicy is in effect.  Cpuset policy
 	 * is enforced in get_page_from_freelist().
 	 */
-	if (nodemask && !nodes_subset(node_states[N_HIGH_MEMORY], *nodemask)) {
+	if (oc->nodemask &&
+	    !nodes_subset(node_states[N_MEMORY], *oc->nodemask)) {
 		*totalpages = total_swap_pages;
-		for_each_node_mask(nid, *nodemask)
+		for_each_node_mask(nid, *oc->nodemask)
 			*totalpages += node_spanned_pages(nid);
 		return CONSTRAINT_MEMORY_POLICY;
 	}
 
 	/* Check this allocation failure is caused by cpuset's wall function */
-	for_each_zone_zonelist_nodemask(zone, z, zonelist,
-			high_zoneidx, nodemask)
-		if (!cpuset_zone_allowed_softwall(zone, gfp_mask))
+	for_each_zone_zonelist_nodemask(zone, z, oc->zonelist,
+			high_zoneidx, oc->nodemask)
+		if (!cpuset_zone_allowed(zone, oc->gfp_mask))
 			cpuset_limited = true;
 
 	if (cpuset_limited) {
@@ -293,108 +265,98 @@ static enum oom_constraint constrained_alloc(struct zonelist *zonelist,
 	return CONSTRAINT_NONE;
 }
 #else
-static enum oom_constraint constrained_alloc(struct zonelist *zonelist,
-				gfp_t gfp_mask, nodemask_t *nodemask,
-				unsigned long *totalpages)
+static enum oom_constraint constrained_alloc(struct oom_control *oc,
+					     unsigned long *totalpages)
 {
 	*totalpages = totalram_pages + total_swap_pages;
 	return CONSTRAINT_NONE;
 }
 #endif
 
+enum oom_scan_t oom_scan_process_thread(struct oom_control *oc,
+			struct task_struct *task, unsigned long totalpages)
+{
+	if (oom_unkillable_task(task, NULL, oc->nodemask))
+		return OOM_SCAN_CONTINUE;
+
+	/*
+	 * This task already has access to memory reserves and is being killed.
+	 * Don't allow any other task to have access to the reserves.
+	 */
+	if (!is_sysrq_oom(oc) && atomic_read(&task->signal->oom_victims))
+		return OOM_SCAN_ABORT;
+
+	/*
+	 * If task is allocating a lot of memory and has been marked to be
+	 * killed first if it triggers an oom, then select it.
+	 */
+	if (oom_task_origin(task))
+		return OOM_SCAN_SELECT;
+
+	return OOM_SCAN_OK;
+}
+
 /*
  * Simple selection loop. We chose the process with the highest
- * number of 'points'. We expect the caller will lock the tasklist.
- *
- * (not docbooked, we don't want this one cluttering up the manual)
+ * number of 'points'.  Returns -1 on scan abort.
  */
-static struct task_struct *select_bad_process(unsigned int *ppoints,
-		unsigned long totalpages, struct mem_cgroup *memcg,
-		const nodemask_t *nodemask, bool force_kill)
+static struct task_struct *select_bad_process(struct oom_control *oc,
+		unsigned int *ppoints, unsigned long totalpages)
 {
-	struct task_struct *g, *p;
+	struct task_struct *p;
 	struct task_struct *chosen = NULL;
-	*ppoints = 0;
+	unsigned long chosen_points = 0;
 
-	do_each_thread(g, p) {
+	rcu_read_lock();
+	for_each_process(p) {
 		unsigned int points;
 
-		if (p->exit_state)
-			continue;
-		if (oom_unkillable_task(p, memcg, nodemask))
-			continue;
-
-		/*
-		 * This task already has access to memory reserves and is
-		 * being killed. Don't allow any other task access to the
-		 * memory reserve.
-		 *
-		 * Note: this may have a chance of deadlock if it gets
-		 * blocked waiting for another task which itself is waiting
-		 * for memory. Is there a better alternative?
-		 */
-		if (test_tsk_thread_flag(p, TIF_MEMDIE)) {
-			if (unlikely(frozen(p)))
-				__thaw_task(p);
-			if (!force_kill)
-				return ERR_PTR(-1UL);
-		}
-		if (!p->mm)
-			continue;
-
-		if (p->flags & PF_EXITING) {
-			/*
-			 * If p is the current task and is in the process of
-			 * releasing memory, we allow the "kill" to set
-			 * TIF_MEMDIE, which will allow it to gain access to
-			 * memory reserves.  Otherwise, it may stall forever.
-			 *
-			 * The loop isn't broken here, however, in case other
-			 * threads are found to have already been oom killed.
-			 */
-			if (p == current) {
-				chosen = p;
-				*ppoints = 1000;
-			} else if (!force_kill) {
-				/*
-				 * If this task is not being ptraced on exit,
-				 * then wait for it to finish before killing
-				 * some other task unnecessarily.
-				 */
-				if (!(p->group_leader->ptrace & PT_TRACE_EXIT))
-					return ERR_PTR(-1UL);
-			}
-		}
-
-		points = oom_badness(p, memcg, nodemask, totalpages);
-		if (points > *ppoints) {
+		switch (oom_scan_process_thread(oc, p, totalpages)) {
+		case OOM_SCAN_SELECT:
 			chosen = p;
-			*ppoints = points;
-		}
-	} while_each_thread(g, p);
+			chosen_points = ULONG_MAX;
+			/* fall through */
+		case OOM_SCAN_CONTINUE:
+			continue;
+		case OOM_SCAN_ABORT:
+			rcu_read_unlock();
+			return (struct task_struct *)(-1UL);
+		case OOM_SCAN_OK:
+			break;
+		};
+		points = oom_badness(p, NULL, oc->nodemask, totalpages);
+		if (!points || points < chosen_points)
+			continue;
 
+		chosen = p;
+		chosen_points = points;
+	}
+	if (chosen)
+		get_task_struct(chosen);
+	rcu_read_unlock();
+
+	*ppoints = chosen_points * 1000 / totalpages;
 	return chosen;
 }
 
 /**
  * dump_tasks - dump current memory state of all system tasks
- * @mem: current's memory controller, if constrained
+ * @memcg: current's memory controller, if constrained
  * @nodemask: nodemask passed to page allocator for mempolicy ooms
  *
  * Dumps the current memory state of all eligible tasks.  Tasks not in the same
  * memcg, not in the same cpuset, or bound to a disjoint set of mempolicy nodes
  * are not shown.
- * State information includes task's pid, uid, tgid, vm size, rss, cpu, oom_adj
- * value, oom_score_adj value, and name.
- *
- * Call with tasklist_lock read-locked.
+ * State information includes task's pid, uid, tgid, vm size, rss, nr_ptes,
+ * swapents, oom_score_adj value, and name.
  */
-void dump_tasks(const struct mem_cgroup *memcg, const nodemask_t *nodemask)
+static void dump_tasks(struct mem_cgroup *memcg, const nodemask_t *nodemask)
 {
 	struct task_struct *p;
 	struct task_struct *task;
 
-	pr_info("[ pid ]   uid  tgid total_vm      rss cpu oom_adj oom_score_adj name\n");
+	pr_info("[ pid ]   uid  tgid total_vm      rss nr_ptes nr_pmds swapents oom_score_adj name\n");
+	rcu_read_lock();
 	for_each_process(p) {
 		if (oom_unkillable_task(p, memcg, nodemask))
 			continue;
@@ -409,62 +371,404 @@ void dump_tasks(const struct mem_cgroup *memcg, const nodemask_t *nodemask)
 			continue;
 		}
 
-		pr_info("[%5d] %5d %5d %8lu %8lu %3u     %3d         %5d %s\n",
-			task->pid, task_uid(task), task->tgid,
-			task->mm->total_vm, get_mm_rss(task->mm),
-			task_cpu(task), task->signal->oom_adj,
+		pr_info("[%5d] %5d %5d %8lu %8lu %7ld %7ld %8lu         %5hd %s\n",
+			task->pid, from_kuid(&init_user_ns, task_uid(task)),
+			task->tgid, task->mm->total_vm, get_mm_rss(task->mm),
+			atomic_long_read(&task->mm->nr_ptes),
+			mm_nr_pmds(task->mm),
+			get_mm_counter(task->mm, MM_SWAPENTS),
 			task->signal->oom_score_adj, task->comm);
 		task_unlock(task);
 	}
+	rcu_read_unlock();
 }
 
-static void dump_header(struct task_struct *p, gfp_t gfp_mask, int order,
-			struct mem_cgroup *memcg, const nodemask_t *nodemask)
+static void dump_header(struct oom_control *oc, struct task_struct *p,
+			struct mem_cgroup *memcg)
 {
-	task_lock(current);
-	pr_warning("%s invoked oom-killer: gfp_mask=0x%x, order=%d, "
-		"oom_adj=%d, oom_score_adj=%d\n",
-		current->comm, gfp_mask, order, current->signal->oom_adj,
+	pr_warn("%s invoked oom-killer: gfp_mask=%#x(%pGg), order=%d, oom_score_adj=%hd\n",
+		current->comm, oc->gfp_mask, &oc->gfp_mask, oc->order,
 		current->signal->oom_score_adj);
-	cpuset_print_task_mems_allowed(current);
-	task_unlock(current);
+
+	cpuset_print_current_mems_allowed();
 	dump_stack();
-	mem_cgroup_print_oom_info(memcg, p);
-	show_mem(SHOW_MEM_FILTER_NODES);
+	if (memcg)
+		mem_cgroup_print_oom_info(memcg, p);
+	else
+		show_mem(SHOW_MEM_FILTER_NODES);
 	if (sysctl_oom_dump_tasks)
-		dump_tasks(memcg, nodemask);
+		dump_tasks(memcg, oc->nodemask);
 }
+
+/*
+ * Number of OOM victims in flight
+ */
+static atomic_t oom_victims = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(oom_victims_wait);
+
+bool oom_killer_disabled __read_mostly;
 
 #define K(x) ((x) << (PAGE_SHIFT-10))
-static void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
-			     unsigned int points, unsigned long totalpages,
-			     struct mem_cgroup *memcg, nodemask_t *nodemask,
-			     const char *message)
+
+/*
+ * task->mm can be NULL if the task is the exited group leader.  So to
+ * determine whether the task is using a particular mm, we examine all the
+ * task's threads: if one of those is using this mm then this task was also
+ * using it.
+ */
+static bool process_shares_mm(struct task_struct *p, struct mm_struct *mm)
+{
+	struct task_struct *t;
+
+	for_each_thread(p, t) {
+		struct mm_struct *t_mm = READ_ONCE(t->mm);
+		if (t_mm)
+			return t_mm == mm;
+	}
+	return false;
+}
+
+
+#ifdef CONFIG_MMU
+/*
+ * OOM Reaper kernel thread which tries to reap the memory used by the OOM
+ * victim (if that is possible) to help the OOM killer to move on.
+ */
+static struct task_struct *oom_reaper_th;
+static DECLARE_WAIT_QUEUE_HEAD(oom_reaper_wait);
+static struct task_struct *oom_reaper_list;
+static DEFINE_SPINLOCK(oom_reaper_lock);
+
+static bool __oom_reap_task(struct task_struct *tsk)
+{
+	struct mmu_gather tlb;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm = NULL;
+	struct task_struct *p;
+	struct zap_details details = {.check_swap_entries = true,
+				      .ignore_dirty = true};
+	bool ret = true;
+
+	/*
+	 * We have to make sure to not race with the victim exit path
+	 * and cause premature new oom victim selection:
+	 * __oom_reap_task		exit_mm
+	 *   atomic_inc_not_zero
+	 *				  mmput
+	 *				    atomic_dec_and_test
+	 *				  exit_oom_victim
+	 *				[...]
+	 *				out_of_memory
+	 *				  select_bad_process
+	 *				    # no TIF_MEMDIE task selects new victim
+	 *  unmap_page_range # frees some memory
+	 */
+	mutex_lock(&oom_lock);
+
+	/*
+	 * Make sure we find the associated mm_struct even when the particular
+	 * thread has already terminated and cleared its mm.
+	 * We might have race with exit path so consider our work done if there
+	 * is no mm.
+	 */
+	p = find_lock_task_mm(tsk);
+	if (!p)
+		goto unlock_oom;
+	mm = p->mm;
+	atomic_inc(&mm->mm_users);
+	task_unlock(p);
+
+	if (!down_read_trylock(&mm->mmap_sem)) {
+		ret = false;
+		goto unlock_oom;
+	}
+
+	tlb_gather_mmu(&tlb, mm, 0, -1);
+	for (vma = mm->mmap ; vma; vma = vma->vm_next) {
+		if (is_vm_hugetlb_page(vma))
+			continue;
+
+		/*
+		 * mlocked VMAs require explicit munlocking before unmap.
+		 * Let's keep it simple here and skip such VMAs.
+		 */
+		if (vma->vm_flags & VM_LOCKED)
+			continue;
+
+		/*
+		 * Only anonymous pages have a good chance to be dropped
+		 * without additional steps which we cannot afford as we
+		 * are OOM already.
+		 *
+		 * We do not even care about fs backed pages because all
+		 * which are reclaimable have already been reclaimed and
+		 * we do not want to block exit_mmap by keeping mm ref
+		 * count elevated without a good reason.
+		 */
+		if (vma_is_anonymous(vma) || !(vma->vm_flags & VM_SHARED))
+			unmap_page_range(&tlb, vma, vma->vm_start, vma->vm_end,
+					 &details);
+	}
+	tlb_finish_mmu(&tlb, 0, -1);
+	pr_info("oom_reaper: reaped process %d (%s), now anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
+			task_pid_nr(tsk), tsk->comm,
+			K(get_mm_counter(mm, MM_ANONPAGES)),
+			K(get_mm_counter(mm, MM_FILEPAGES)),
+			K(get_mm_counter(mm, MM_SHMEMPAGES)));
+	up_read(&mm->mmap_sem);
+
+	/*
+	 * This task can be safely ignored because we cannot do much more
+	 * to release its memory.
+	 */
+	set_bit(MMF_OOM_REAPED, &mm->flags);
+unlock_oom:
+	mutex_unlock(&oom_lock);
+	/*
+	 * Drop our reference but make sure the mmput slow path is called from a
+	 * different context because we shouldn't risk we get stuck there and
+	 * put the oom_reaper out of the way.
+	 */
+	if (mm)
+		mmput_async(mm);
+	return ret;
+}
+
+#define MAX_OOM_REAP_RETRIES 10
+static void oom_reap_task(struct task_struct *tsk)
+{
+	int attempts = 0;
+
+	/* Retry the down_read_trylock(mmap_sem) a few times */
+	while (attempts++ < MAX_OOM_REAP_RETRIES && !__oom_reap_task(tsk))
+		schedule_timeout_idle(HZ/10);
+
+	if (attempts > MAX_OOM_REAP_RETRIES) {
+		pr_info("oom_reaper: unable to reap pid:%d (%s)\n",
+				task_pid_nr(tsk), tsk->comm);
+		debug_show_all_locks();
+	}
+
+	/*
+	 * Clear TIF_MEMDIE because the task shouldn't be sitting on a
+	 * reasonably reclaimable memory anymore or it is not a good candidate
+	 * for the oom victim right now because it cannot release its memory
+	 * itself nor by the oom reaper.
+	 */
+	tsk->oom_reaper_list = NULL;
+	exit_oom_victim(tsk);
+
+	/* Drop a reference taken by wake_oom_reaper */
+	put_task_struct(tsk);
+}
+
+static int oom_reaper(void *unused)
+{
+	set_freezable();
+
+	while (true) {
+		struct task_struct *tsk = NULL;
+
+		wait_event_freezable(oom_reaper_wait, oom_reaper_list != NULL);
+		spin_lock(&oom_reaper_lock);
+		if (oom_reaper_list != NULL) {
+			tsk = oom_reaper_list;
+			oom_reaper_list = tsk->oom_reaper_list;
+		}
+		spin_unlock(&oom_reaper_lock);
+
+		if (tsk)
+			oom_reap_task(tsk);
+	}
+
+	return 0;
+}
+
+static void wake_oom_reaper(struct task_struct *tsk)
+{
+	if (!oom_reaper_th)
+		return;
+
+	/* tsk is already queued? */
+	if (tsk == oom_reaper_list || tsk->oom_reaper_list)
+		return;
+
+	get_task_struct(tsk);
+
+	spin_lock(&oom_reaper_lock);
+	tsk->oom_reaper_list = oom_reaper_list;
+	oom_reaper_list = tsk;
+	spin_unlock(&oom_reaper_lock);
+	wake_up(&oom_reaper_wait);
+}
+
+/* Check if we can reap the given task. This has to be called with stable
+ * tsk->mm
+ */
+void try_oom_reaper(struct task_struct *tsk)
+{
+	struct mm_struct *mm = tsk->mm;
+	struct task_struct *p;
+
+	if (!mm)
+		return;
+
+	/*
+	 * There might be other threads/processes which are either not
+	 * dying or even not killable.
+	 */
+	if (atomic_read(&mm->mm_users) > 1) {
+		rcu_read_lock();
+		for_each_process(p) {
+			if (!process_shares_mm(p, mm))
+				continue;
+			if (fatal_signal_pending(p))
+				continue;
+
+			/*
+			 * If the task is exiting make sure the whole thread group
+			 * is exiting and cannot acces mm anymore.
+			 */
+			if (signal_group_exit(p->signal))
+				continue;
+
+			/* Give up */
+			rcu_read_unlock();
+			return;
+		}
+		rcu_read_unlock();
+	}
+
+	wake_oom_reaper(tsk);
+}
+
+static int __init oom_init(void)
+{
+	oom_reaper_th = kthread_run(oom_reaper, NULL, "oom_reaper");
+	if (IS_ERR(oom_reaper_th)) {
+		pr_err("Unable to start OOM reaper %ld. Continuing regardless\n",
+				PTR_ERR(oom_reaper_th));
+		oom_reaper_th = NULL;
+	}
+	return 0;
+}
+subsys_initcall(oom_init)
+#else
+static void wake_oom_reaper(struct task_struct *tsk)
+{
+}
+#endif
+
+/**
+ * mark_oom_victim - mark the given task as OOM victim
+ * @tsk: task to mark
+ *
+ * Has to be called with oom_lock held and never after
+ * oom has been disabled already.
+ */
+void mark_oom_victim(struct task_struct *tsk)
+{
+	WARN_ON(oom_killer_disabled);
+	/* OOM killer might race with memcg OOM */
+	if (test_and_set_tsk_thread_flag(tsk, TIF_MEMDIE))
+		return;
+	atomic_inc(&tsk->signal->oom_victims);
+	/*
+	 * Make sure that the task is woken up from uninterruptible sleep
+	 * if it is frozen because OOM killer wouldn't be able to free
+	 * any memory and livelock. freezing_slow_path will tell the freezer
+	 * that TIF_MEMDIE tasks should be ignored.
+	 */
+	__thaw_task(tsk);
+	atomic_inc(&oom_victims);
+}
+
+/**
+ * exit_oom_victim - note the exit of an OOM victim
+ */
+void exit_oom_victim(struct task_struct *tsk)
+{
+	if (!test_and_clear_tsk_thread_flag(tsk, TIF_MEMDIE))
+		return;
+	atomic_dec(&tsk->signal->oom_victims);
+
+	if (!atomic_dec_return(&oom_victims))
+		wake_up_all(&oom_victims_wait);
+}
+
+/**
+ * oom_killer_disable - disable OOM killer
+ *
+ * Forces all page allocations to fail rather than trigger OOM killer.
+ * Will block and wait until all OOM victims are killed.
+ *
+ * The function cannot be called when there are runnable user tasks because
+ * the userspace would see unexpected allocation failures as a result. Any
+ * new usage of this function should be consulted with MM people.
+ *
+ * Returns true if successful and false if the OOM killer cannot be
+ * disabled.
+ */
+bool oom_killer_disable(void)
+{
+	/*
+	 * Make sure to not race with an ongoing OOM killer. Check that the
+	 * current is not killed (possibly due to sharing the victim's memory).
+	 */
+	if (mutex_lock_killable(&oom_lock))
+		return false;
+	oom_killer_disabled = true;
+	mutex_unlock(&oom_lock);
+
+	wait_event(oom_victims_wait, !atomic_read(&oom_victims));
+
+	return true;
+}
+
+/**
+ * oom_killer_enable - enable OOM killer
+ */
+void oom_killer_enable(void)
+{
+	oom_killer_disabled = false;
+}
+
+/*
+ * Must be called while holding a reference to p, which will be released upon
+ * returning.
+ */
+void oom_kill_process(struct oom_control *oc, struct task_struct *p,
+		      unsigned int points, unsigned long totalpages,
+		      struct mem_cgroup *memcg, const char *message)
 {
 	struct task_struct *victim = p;
 	struct task_struct *child;
-	struct task_struct *t = p;
+	struct task_struct *t;
 	struct mm_struct *mm;
 	unsigned int victim_points = 0;
 	static DEFINE_RATELIMIT_STATE(oom_rs, DEFAULT_RATELIMIT_INTERVAL,
 					      DEFAULT_RATELIMIT_BURST);
+	bool can_oom_reap = true;
 
 	/*
 	 * If the task is already exiting, don't alarm the sysadmin or kill
 	 * its children or threads, just set TIF_MEMDIE so it can die quickly
 	 */
-	if (p->flags & PF_EXITING) {
-		set_tsk_thread_flag(p, TIF_MEMDIE);
+	task_lock(p);
+	if (p->mm && task_will_free_mem(p)) {
+		mark_oom_victim(p);
+		try_oom_reaper(p);
+		task_unlock(p);
+		put_task_struct(p);
 		return;
 	}
+	task_unlock(p);
 
 	if (__ratelimit(&oom_rs))
-		dump_header(p, gfp_mask, order, memcg, nodemask);
+		dump_header(oc, p, memcg);
 
-	task_lock(p);
-	pr_err("%s: Kill process %d (%s) score %d or sacrifice child\n",
+	pr_err("%s: Kill process %d (%s) score %u or sacrifice child\n",
 		message, task_pid_nr(p), p->comm, points);
-	task_unlock(p);
 
 	/*
 	 * If any of p's children has a different mm and is eligible for kill,
@@ -472,34 +776,53 @@ static void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
 	 * parent.  This attempts to lose the minimal amount of work done while
 	 * still freeing memory.
 	 */
-	do {
+	read_lock(&tasklist_lock);
+	for_each_thread(p, t) {
 		list_for_each_entry(child, &t->children, sibling) {
 			unsigned int child_points;
 
-			if (child->mm == p->mm)
+			if (process_shares_mm(child, p->mm))
 				continue;
 			/*
 			 * oom_badness() returns 0 if the thread is unkillable
 			 */
-			child_points = oom_badness(child, memcg, nodemask,
+			child_points = oom_badness(child, memcg, oc->nodemask,
 								totalpages);
 			if (child_points > victim_points) {
+				put_task_struct(victim);
 				victim = child;
 				victim_points = child_points;
+				get_task_struct(victim);
 			}
 		}
-	} while_each_thread(p, t);
+	}
+	read_unlock(&tasklist_lock);
 
-	victim = find_lock_task_mm(victim);
-	if (!victim)
+	p = find_lock_task_mm(victim);
+	if (!p) {
+		put_task_struct(victim);
 		return;
+	} else if (victim != p) {
+		get_task_struct(p);
+		put_task_struct(victim);
+		victim = p;
+	}
 
-	/* mm cannot safely be dereferenced after task_unlock(victim) */
+	/* Get a reference to safely compare mm after task_unlock(victim) */
 	mm = victim->mm;
-	pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB\n",
+	atomic_inc(&mm->mm_count);
+	/*
+	 * We should send SIGKILL before setting TIF_MEMDIE in order to prevent
+	 * the OOM victim from depleting the memory reserves from the user
+	 * space under its control.
+	 */
+	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
+	mark_oom_victim(victim);
+	pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
 		task_pid_nr(victim), victim->comm, K(victim->mm->total_vm),
 		K(get_mm_counter(victim->mm, MM_ANONPAGES)),
-		K(get_mm_counter(victim->mm, MM_FILEPAGES)));
+		K(get_mm_counter(victim->mm, MM_FILEPAGES)),
+		K(get_mm_counter(victim->mm, MM_SHMEMPAGES)));
 	task_unlock(victim);
 
 	/*
@@ -511,29 +834,39 @@ static void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
 	 * That thread will now get access to memory reserves since it has a
 	 * pending fatal signal.
 	 */
-	for_each_process(p)
-		if (p->mm == mm && !same_thread_group(p, victim) &&
-		    !(p->flags & PF_KTHREAD)) {
-			if (p->signal->oom_score_adj == OOM_SCORE_ADJ_MIN)
-				continue;
-
-			task_lock(p);	/* Protect ->comm from prctl() */
-			pr_err("Kill process %d (%s) sharing same memory\n",
-				task_pid_nr(p), p->comm);
-			task_unlock(p);
-			do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
+	rcu_read_lock();
+	for_each_process(p) {
+		if (!process_shares_mm(p, mm))
+			continue;
+		if (same_thread_group(p, victim))
+			continue;
+		if (unlikely(p->flags & PF_KTHREAD) || is_global_init(p) ||
+		    p->signal->oom_score_adj == OOM_SCORE_ADJ_MIN) {
+			/*
+			 * We cannot use oom_reaper for the mm shared by this
+			 * process because it wouldn't get killed and so the
+			 * memory might be still used.
+			 */
+			can_oom_reap = false;
+			continue;
 		}
+		do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
+	}
+	rcu_read_unlock();
 
-	set_tsk_thread_flag(victim, TIF_MEMDIE);
-	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
+	if (can_oom_reap)
+		wake_oom_reaper(victim);
+
+	mmdrop(mm);
+	put_task_struct(victim);
 }
 #undef K
 
 /*
  * Determines whether the kernel must panic because of the panic_on_oom sysctl.
  */
-static void check_panic_on_oom(enum oom_constraint constraint, gfp_t gfp_mask,
-				int order, const nodemask_t *nodemask)
+void check_panic_on_oom(struct oom_control *oc, enum oom_constraint constraint,
+			struct mem_cgroup *memcg)
 {
 	if (likely(!sysctl_panic_on_oom))
 		return;
@@ -546,41 +879,13 @@ static void check_panic_on_oom(enum oom_constraint constraint, gfp_t gfp_mask,
 		if (constraint != CONSTRAINT_NONE)
 			return;
 	}
-	read_lock(&tasklist_lock);
-	dump_header(NULL, gfp_mask, order, NULL, nodemask);
-	read_unlock(&tasklist_lock);
+	/* Do not panic for oom kills triggered by sysrq */
+	if (is_sysrq_oom(oc))
+		return;
+	dump_header(oc, NULL, memcg);
 	panic("Out of memory: %s panic_on_oom is enabled\n",
 		sysctl_panic_on_oom == 2 ? "compulsory" : "system-wide");
 }
-
-#ifdef CONFIG_CGROUP_MEM_RES_CTLR
-void mem_cgroup_out_of_memory(struct mem_cgroup *memcg, gfp_t gfp_mask,
-			      int order)
-{
-	unsigned long limit;
-	unsigned int points = 0;
-	struct task_struct *p;
-
-	/*
-	 * If current has a pending SIGKILL, then automatically select it.  The
-	 * goal is to allow it to allocate so that it may quickly exit and free
-	 * its memory.
-	 */
-	if (fatal_signal_pending(current)) {
-		set_thread_flag(TIF_MEMDIE);
-		return;
-	}
-
-	check_panic_on_oom(CONSTRAINT_MEMCG, gfp_mask, order, NULL);
-	limit = mem_cgroup_get_limit(memcg) >> PAGE_SHIFT;
-	read_lock(&tasklist_lock);
-	p = select_bad_process(&points, limit, memcg, NULL, false);
-	if (p && PTR_ERR(p) != -1UL)
-		oom_kill_process(p, gfp_mask, order, points, limit, memcg, NULL,
-				 "Memory cgroup out of memory");
-	read_unlock(&tasklist_lock);
-}
-#endif
 
 static BLOCKING_NOTIFIER_HEAD(oom_notify_list);
 
@@ -596,187 +901,120 @@ int unregister_oom_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(unregister_oom_notifier);
 
-/*
- * Try to acquire the OOM killer lock for the zones in zonelist.  Returns zero
- * if a parallel OOM killing is already taking place that includes a zone in
- * the zonelist.  Otherwise, locks all zones in the zonelist and returns 1.
- */
-int try_set_zonelist_oom(struct zonelist *zonelist, gfp_t gfp_mask)
-{
-	struct zoneref *z;
-	struct zone *zone;
-	int ret = 1;
-
-	spin_lock(&zone_scan_lock);
-	for_each_zone_zonelist(zone, z, zonelist, gfp_zone(gfp_mask)) {
-		if (zone_is_oom_locked(zone)) {
-			ret = 0;
-			goto out;
-		}
-	}
-
-	for_each_zone_zonelist(zone, z, zonelist, gfp_zone(gfp_mask)) {
-		/*
-		 * Lock each zone in the zonelist under zone_scan_lock so a
-		 * parallel invocation of try_set_zonelist_oom() doesn't succeed
-		 * when it shouldn't.
-		 */
-		zone_set_flag(zone, ZONE_OOM_LOCKED);
-	}
-
-out:
-	spin_unlock(&zone_scan_lock);
-	return ret;
-}
-
-/*
- * Clears the ZONE_OOM_LOCKED flag for all zones in the zonelist so that failed
- * allocation attempts with zonelists containing them may now recall the OOM
- * killer, if necessary.
- */
-void clear_zonelist_oom(struct zonelist *zonelist, gfp_t gfp_mask)
-{
-	struct zoneref *z;
-	struct zone *zone;
-
-	spin_lock(&zone_scan_lock);
-	for_each_zone_zonelist(zone, z, zonelist, gfp_zone(gfp_mask)) {
-		zone_clear_flag(zone, ZONE_OOM_LOCKED);
-	}
-	spin_unlock(&zone_scan_lock);
-}
-
-/*
- * Try to acquire the oom killer lock for all system zones.  Returns zero if a
- * parallel oom killing is taking place, otherwise locks all zones and returns
- * non-zero.
- */
-static int try_set_system_oom(void)
-{
-	struct zone *zone;
-	int ret = 1;
-
-	spin_lock(&zone_scan_lock);
-	for_each_populated_zone(zone)
-		if (zone_is_oom_locked(zone)) {
-			ret = 0;
-			goto out;
-		}
-	for_each_populated_zone(zone)
-		zone_set_flag(zone, ZONE_OOM_LOCKED);
-out:
-	spin_unlock(&zone_scan_lock);
-	return ret;
-}
-
-/*
- * Clears ZONE_OOM_LOCKED for all system zones so that failed allocation
- * attempts or page faults may now recall the oom killer, if necessary.
- */
-static void clear_system_oom(void)
-{
-	struct zone *zone;
-
-	spin_lock(&zone_scan_lock);
-	for_each_populated_zone(zone)
-		zone_clear_flag(zone, ZONE_OOM_LOCKED);
-	spin_unlock(&zone_scan_lock);
-}
-
 /**
  * out_of_memory - kill the "best" process when we run out of memory
- * @zonelist: zonelist pointer
- * @gfp_mask: memory allocation flags
- * @order: amount of memory being requested as a power of 2
- * @nodemask: nodemask passed to page allocator
- * @force_kill: true if a task must be killed, even if others are exiting
+ * @oc: pointer to struct oom_control
  *
  * If we run out of memory, we have the choice between either
  * killing a random task (bad), letting the system crash (worse)
  * OR try to be smart about which process to kill. Note that we
  * don't have to be perfect here, we just have to be good.
  */
-void out_of_memory(struct zonelist *zonelist, gfp_t gfp_mask,
-		int order, nodemask_t *nodemask, bool force_kill)
+bool out_of_memory(struct oom_control *oc)
 {
-	const nodemask_t *mpol_mask;
 	struct task_struct *p;
 	unsigned long totalpages;
 	unsigned long freed = 0;
-	unsigned int points;
+	unsigned int uninitialized_var(points);
 	enum oom_constraint constraint = CONSTRAINT_NONE;
-	int killed = 0;
+
+	if (oom_killer_disabled)
+		return false;
 
 	blocking_notifier_call_chain(&oom_notify_list, 0, &freed);
 	if (freed > 0)
 		/* Got some memory back in the last second. */
-		return;
+		return true;
 
 	/*
-	 * If current has a pending SIGKILL, then automatically select it.  The
-	 * goal is to allow it to allocate so that it may quickly exit and free
-	 * its memory.
+	 * If current has a pending SIGKILL or is exiting, then automatically
+	 * select it.  The goal is to allow it to allocate so that it may
+	 * quickly exit and free its memory.
+	 *
+	 * But don't select if current has already released its mm and cleared
+	 * TIF_MEMDIE flag at exit_mm(), otherwise an OOM livelock may occur.
 	 */
-	if (fatal_signal_pending(current)) {
-		set_thread_flag(TIF_MEMDIE);
-		return;
+	if (current->mm &&
+	    (fatal_signal_pending(current) || task_will_free_mem(current))) {
+		mark_oom_victim(current);
+		try_oom_reaper(current);
+		return true;
 	}
+
+	/*
+	 * The OOM killer does not compensate for IO-less reclaim.
+	 * pagefault_out_of_memory lost its gfp context so we have to
+	 * make sure exclude 0 mask - all other users should have at least
+	 * ___GFP_DIRECT_RECLAIM to get here.
+	 */
+	if (oc->gfp_mask && !(oc->gfp_mask & (__GFP_FS|__GFP_NOFAIL)))
+		return true;
 
 	/*
 	 * Check if there were limitations on the allocation (only relevant for
 	 * NUMA) that may require different handling.
 	 */
-	constraint = constrained_alloc(zonelist, gfp_mask, nodemask,
-						&totalpages);
-	mpol_mask = (constraint == CONSTRAINT_MEMORY_POLICY) ? nodemask : NULL;
-	check_panic_on_oom(constraint, gfp_mask, order, mpol_mask);
+	constraint = constrained_alloc(oc, &totalpages);
+	if (constraint != CONSTRAINT_MEMORY_POLICY)
+		oc->nodemask = NULL;
+	check_panic_on_oom(oc, constraint, NULL);
 
-	read_lock(&tasklist_lock);
-	if (sysctl_oom_kill_allocating_task &&
-	    !oom_unkillable_task(current, NULL, nodemask) &&
-	    current->mm) {
-		oom_kill_process(current, gfp_mask, order, 0, totalpages, NULL,
-				 nodemask,
+	if (sysctl_oom_kill_allocating_task && current->mm &&
+	    !oom_unkillable_task(current, NULL, oc->nodemask) &&
+	    current->signal->oom_score_adj != OOM_SCORE_ADJ_MIN) {
+		get_task_struct(current);
+		oom_kill_process(oc, current, 0, totalpages, NULL,
 				 "Out of memory (oom_kill_allocating_task)");
-		goto out;
+		return true;
 	}
 
-	p = select_bad_process(&points, totalpages, NULL, mpol_mask,
-			       force_kill);
+	p = select_bad_process(oc, &points, totalpages);
 	/* Found nothing?!?! Either we hang forever, or we panic. */
-	if (!p) {
-		dump_header(NULL, gfp_mask, order, NULL, mpol_mask);
-		read_unlock(&tasklist_lock);
+	if (!p && !is_sysrq_oom(oc)) {
+		dump_header(oc, NULL, NULL);
 		panic("Out of memory and no killable processes...\n");
 	}
-	if (PTR_ERR(p) != -1UL) {
-		oom_kill_process(p, gfp_mask, order, points, totalpages, NULL,
-				 nodemask, "Out of memory");
-		killed = 1;
+	if (p && p != (void *)-1UL) {
+		oom_kill_process(oc, p, points, totalpages, NULL,
+				 "Out of memory");
+		/*
+		 * Give the killed process a good chance to exit before trying
+		 * to allocate memory again.
+		 */
+		schedule_timeout_killable(1);
 	}
-out:
-	read_unlock(&tasklist_lock);
-
-	/*
-	 * Give "p" a good chance of killing itself before we
-	 * retry to allocate memory unless "p" is current
-	 */
-	if (killed && !test_thread_flag(TIF_MEMDIE))
-		schedule_timeout_uninterruptible(1);
+	return true;
 }
 
 /*
  * The pagefault handler calls here because it is out of memory, so kill a
- * memory-hogging task.  If a populated zone has ZONE_OOM_LOCKED set, a parallel
- * oom killing is already in progress so do nothing.  If a task is found with
- * TIF_MEMDIE set, it has been killed so do nothing and allow it to exit.
+ * memory-hogging task.  If any populated zone has ZONE_OOM_LOCKED set, a
+ * parallel oom killing is already in progress so do nothing.
  */
 void pagefault_out_of_memory(void)
 {
-	if (try_set_system_oom()) {
-		out_of_memory(NULL, 0, 0, NULL, false);
-		clear_system_oom();
+	struct oom_control oc = {
+		.zonelist = NULL,
+		.nodemask = NULL,
+		.gfp_mask = 0,
+		.order = 0,
+	};
+
+	if (mem_cgroup_oom_synchronize(true))
+		return;
+
+	if (!mutex_trylock(&oom_lock))
+		return;
+
+	if (!out_of_memory(&oc)) {
+		/*
+		 * There shouldn't be any user tasks runnable while the
+		 * OOM killer is disabled, so the current task has to
+		 * be a racing OOM victim for which oom_killer_disable()
+		 * is waiting for.
+		 */
+		WARN_ON(test_thread_flag(TIF_MEMDIE));
 	}
-	if (!test_thread_flag(TIF_MEMDIE))
-		schedule_timeout_uninterruptible(1);
+
+	mutex_unlock(&oom_lock);
 }

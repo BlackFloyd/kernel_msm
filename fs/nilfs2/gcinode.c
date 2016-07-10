@@ -13,13 +13,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- * Written by Seiji Kihara <kihara@osrg.net>, Amagai Yoshiji <amagai@osrg.net>,
- *            and Ryusuke Konishi <ryusuke@osrg.net>.
- * Revised by Ryusuke Konishi <ryusuke@osrg.net>.
+ * Written by Seiji Kihara, Amagai Yoshiji, and Ryusuke Konishi.
+ * Revised by Ryusuke Konishi.
  *
  */
 /*
@@ -115,7 +110,7 @@ int nilfs_gccache_submit_read_data(struct inode *inode, sector_t blkoff,
 
  failed:
 	unlock_page(bh->b_page);
-	page_cache_release(bh->b_page);
+	put_page(bh->b_page);
 	return err;
 }
 
@@ -172,7 +167,6 @@ int nilfs_init_gcinode(struct inode *inode)
 	inode->i_mode = S_IFREG;
 	mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);
 	inode->i_mapping->a_ops = &empty_aops;
-	inode->i_mapping->backing_dev_info = inode->i_sb->s_bdi;
 
 	ii->i_flags = 0;
 	nilfs_bmap_init_gc(ii->i_bmap);
@@ -191,6 +185,8 @@ void nilfs_remove_all_gcinodes(struct the_nilfs *nilfs)
 	while (!list_empty(head)) {
 		ii = list_first_entry(head, struct nilfs_inode_info, i_dirty);
 		list_del_init(&ii->i_dirty);
+		truncate_inode_pages(&ii->vfs_inode.i_data, 0);
+		nilfs_btnode_cache_clear(&ii->i_btnode_cache);
 		iput(&ii->vfs_inode);
 	}
 }

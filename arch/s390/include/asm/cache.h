@@ -1,8 +1,6 @@
 /*
- *  include/asm-s390/cache.h
- *
  *  S390 version
- *    Copyright (C) 1999 IBM Deutschland Entwicklung GmbH, IBM Corporation
+ *    Copyright IBM Corp. 1999
  *
  *  Derived from "include/asm-i386/cache.h"
  *    Copyright (C) 1992, Linus Torvalds
@@ -16,5 +14,8 @@
 #define NET_SKB_PAD	   32
 
 #define __read_mostly __attribute__((__section__(".data..read_mostly")))
+
+/* Read-only memory is marked before mark_rodata_ro() is called. */
+#define __ro_after_init __read_mostly
 
 #endif

@@ -261,7 +261,7 @@ static void flatten_tree(struct node *tree, struct emitter *emit,
 {
 	struct property *prop;
 	struct node *child;
-	int seen_name_prop = 0;
+	bool seen_name_prop = false;
 
 	if (tree->deleted)
 		return;
@@ -279,7 +279,7 @@ static void flatten_tree(struct node *tree, struct emitter *emit,
 		int nameoff;
 
 		if (streq(prop->name, "name"))
-			seen_name_prop = 1;
+			seen_name_prop = true;
 
 		nameoff = stringtable_insert(strbuf, prop->name);
 
@@ -376,7 +376,6 @@ void dt_to_blob(FILE *f, struct boot_info *bi, int version)
 	struct data strbuf     = empty_data;
 	struct fdt_header fdt;
 	int padlen = 0;
-	int tsize;
 
 	for (i = 0; i < ARRAY_SIZE(version_table); i++) {
 		if (version_table[i].version == version)
@@ -408,23 +407,11 @@ void dt_to_blob(FILE *f, struct boot_info *bi, int version)
 	if (padsize > 0)
 		padlen = padsize;
 
-	tsize = fdt32_to_cpu(fdt.totalsize);
-	if (padlen > 0)
+	if (padlen > 0) {
+		int tsize = fdt32_to_cpu(fdt.totalsize);
 		tsize += padlen;
-
-	/*
-	 * align to 4 bytes
-	 */
-	if (tsize & 3) {
-		/*
-		 * padlen will be used in writing blob.
-		 * we need to update padlen for aligment tsize and dtb size
-		 */
-		padlen += (4 - (tsize & 3));
-		tsize = ALIGN(tsize, 4);
+		fdt.totalsize = cpu_to_fdt32(tsize);
 	}
-
-	fdt.totalsize = cpu_to_fdt32(tsize);
 
 	/*
 	 * Assemble the blob: start with the header, add with alignment
@@ -902,7 +889,7 @@ struct boot_info *dt_from_blob(const char *fname)
 
 	if (version >= 3) {
 		uint32_t size_str = fdt32_to_cpu(fdt->size_dt_strings);
-		if (off_str+size_str > totalsize)
+		if ((off_str+size_str < off_str) || (off_str+size_str > totalsize))
 			die("String table extends past total size\n");
 		inbuf_init(&strbuf, blob + off_str, blob + off_str + size_str);
 	} else {
@@ -911,7 +898,7 @@ struct boot_info *dt_from_blob(const char *fname)
 
 	if (version >= 17) {
 		size_dt = fdt32_to_cpu(fdt->size_dt_struct);
-		if (off_dt+size_dt > totalsize)
+		if ((off_dt+size_dt < off_dt) || (off_dt+size_dt > totalsize))
 			die("Structure block extends past total size\n");
 	}
 

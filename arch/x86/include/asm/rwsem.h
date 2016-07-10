@@ -25,7 +25,7 @@
  * This should be totally fair - if anything is waiting, a process that wants a
  * lock will go to the back of the queue. When the currently active lock is
  * released, if there's a writer at the front of the queue, then that and only
- * that will be woken up; if there's a bunch of consequtive readers at the
+ * that will be woken up; if there's a bunch of consecutive readers at the
  * front, then they'll all be woken up, but no other readers will be.
  */
 
@@ -99,26 +99,36 @@ static inline int __down_read_trylock(struct rw_semaphore *sem)
 /*
  * lock for writing
  */
-static inline void __down_write_nested(struct rw_semaphore *sem, int subclass)
-{
-	long tmp;
-	asm volatile("# beginning down_write\n\t"
-		     LOCK_PREFIX "  xadd      %1,(%2)\n\t"
-		     /* adds 0xffff0001, returns the old value */
-		     "  test      %1,%1\n\t"
-		     /* was the count 0 before? */
-		     "  jz        1f\n"
-		     "  call call_rwsem_down_write_failed\n"
-		     "1:\n"
-		     "# ending down_write"
-		     : "+m" (sem->count), "=d" (tmp)
-		     : "a" (sem), "1" (RWSEM_ACTIVE_WRITE_BIAS)
-		     : "memory", "cc");
-}
+#define ____down_write(sem, slow_path)			\
+({							\
+	long tmp;					\
+	struct rw_semaphore* ret;			\
+	asm volatile("# beginning down_write\n\t"	\
+		     LOCK_PREFIX "  xadd      %1,(%3)\n\t"	\
+		     /* adds 0xffff0001, returns the old value */ \
+		     "  test " __ASM_SEL(%w1,%k1) "," __ASM_SEL(%w1,%k1) "\n\t" \
+		     /* was the active mask 0 before? */\
+		     "  jz        1f\n"			\
+		     "  call " slow_path "\n"		\
+		     "1:\n"				\
+		     "# ending down_write"		\
+		     : "+m" (sem->count), "=d" (tmp), "=a" (ret)	\
+		     : "a" (sem), "1" (RWSEM_ACTIVE_WRITE_BIAS) \
+		     : "memory", "cc");			\
+	ret;						\
+})
 
 static inline void __down_write(struct rw_semaphore *sem)
 {
-	__down_write_nested(sem, 0);
+	____down_write(sem, "call_rwsem_down_write_failed");
+}
+
+static inline int __down_write_killable(struct rw_semaphore *sem)
+{
+	if (IS_ERR(____down_write(sem, "call_rwsem_down_write_failed_killable")))
+		return -EINTR;
+
+	return 0;
 }
 
 /*
@@ -126,11 +136,25 @@ static inline void __down_write(struct rw_semaphore *sem)
  */
 static inline int __down_write_trylock(struct rw_semaphore *sem)
 {
-	long ret = cmpxchg(&sem->count, RWSEM_UNLOCKED_VALUE,
-			   RWSEM_ACTIVE_WRITE_BIAS);
-	if (ret == RWSEM_UNLOCKED_VALUE)
-		return 1;
-	return 0;
+	long result, tmp;
+	asm volatile("# beginning __down_write_trylock\n\t"
+		     "  mov          %0,%1\n\t"
+		     "1:\n\t"
+		     "  test " __ASM_SEL(%w1,%k1) "," __ASM_SEL(%w1,%k1) "\n\t"
+		     /* was the active mask 0 before? */
+		     "  jnz          2f\n\t"
+		     "  mov          %1,%2\n\t"
+		     "  add          %3,%2\n\t"
+		     LOCK_PREFIX "  cmpxchg  %2,%0\n\t"
+		     "  jnz	     1b\n\t"
+		     "2:\n\t"
+		     "  sete         %b1\n\t"
+		     "  movzbl       %b1, %k1\n\t"
+		     "# ending __down_write_trylock\n\t"
+		     : "+m" (sem->count), "=&a" (result), "=&r" (tmp)
+		     : "er" (RWSEM_ACTIVE_WRITE_BIAS)
+		     : "memory", "cc");
+	return result;
 }
 
 /*

@@ -13,11 +13,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- * Written by Ryusuke Konishi <ryusuke@osrg.net>
+ * Written by Ryusuke Konishi.
  *
  */
 
@@ -76,6 +72,7 @@ struct the_nilfs *alloc_nilfs(struct block_device *bdev)
 	nilfs->ns_bdev = bdev;
 	atomic_set(&nilfs->ns_ndirtyblks, 0);
 	init_rwsem(&nilfs->ns_sem);
+	mutex_init(&nilfs->ns_snapshot_mount_mutex);
 	INIT_LIST_HEAD(&nilfs->ns_dirty_files);
 	INIT_LIST_HEAD(&nilfs->ns_gc_inodes);
 	spin_lock_init(&nilfs->ns_inode_lock);
@@ -84,6 +81,7 @@ struct the_nilfs *alloc_nilfs(struct block_device *bdev)
 	nilfs->ns_cptree = RB_ROOT;
 	spin_lock_init(&nilfs->ns_cptree_lock);
 	init_rwsem(&nilfs->ns_segctor_sem);
+	nilfs->ns_sb_update_freq = NILFS_SB_FREQ;
 
 	return nilfs;
 }
@@ -96,6 +94,7 @@ void destroy_nilfs(struct the_nilfs *nilfs)
 {
 	might_sleep();
 	if (nilfs_init(nilfs)) {
+		nilfs_sysfs_delete_device_group(nilfs);
 		brelse(nilfs->ns_sbh[0]);
 		brelse(nilfs->ns_sbh[1]);
 	}
@@ -109,8 +108,8 @@ static int nilfs_load_super_root(struct the_nilfs *nilfs,
 	struct nilfs_super_root *raw_sr;
 	struct nilfs_super_block **sbp = nilfs->ns_sbp;
 	struct nilfs_inode *rawi;
-	unsigned dat_entry_size, segment_usage_size, checkpoint_size;
-	unsigned inode_size;
+	unsigned int dat_entry_size, segment_usage_size, checkpoint_size;
+	unsigned int inode_size;
 	int err;
 
 	err = nilfs_read_super_root_block(nilfs, sr_block, &bh_sr, 1);
@@ -398,6 +397,16 @@ static int nilfs_store_disk_layout(struct the_nilfs *nilfs,
 		return -EINVAL;
 
 	nilfs->ns_inode_size = le16_to_cpu(sbp->s_inode_size);
+	if (nilfs->ns_inode_size > nilfs->ns_blocksize) {
+		printk(KERN_ERR "NILFS: too large inode size: %d bytes.\n",
+		       nilfs->ns_inode_size);
+		return -EINVAL;
+	} else if (nilfs->ns_inode_size < NILFS_MIN_INODE_SIZE) {
+		printk(KERN_ERR "NILFS: too small inode size: %d bytes.\n",
+		       nilfs->ns_inode_size);
+		return -EINVAL;
+	}
+
 	nilfs->ns_first_ino = le32_to_cpu(sbp->s_first_ino);
 
 	nilfs->ns_blocks_per_segment = le32_to_cpu(sbp->s_blocks_per_segment);
@@ -430,7 +439,7 @@ static int nilfs_valid_sb(struct nilfs_super_block *sbp)
 	if (!sbp || le16_to_cpu(sbp->s_magic) != NILFS_SUPER_MAGIC)
 		return 0;
 	bytes = le16_to_cpu(sbp->s_bytes);
-	if (bytes > BLOCK_SIZE)
+	if (bytes < sumoff + 4 || bytes > BLOCK_SIZE)
 		return 0;
 	crc = crc32_le(le32_to_cpu(sbp->s_crc_seed), (unsigned char *)sbp,
 		       sumoff);
@@ -608,8 +617,10 @@ int init_nilfs(struct the_nilfs *nilfs, struct super_block *sb, char *data)
 		err = nilfs_load_super_block(nilfs, sb, blocksize, &sbp);
 		if (err)
 			goto out;
-			/* not failed_sbh; sbh is released automatically
-			   when reloading fails. */
+			/*
+			 * Not to failed_sbh; sbh is released automatically
+			 * when reloading fails.
+			 */
 	}
 	nilfs->ns_blocksize_bits = sb->s_blocksize_bits;
 	nilfs->ns_blocksize = blocksize;
@@ -626,6 +637,10 @@ int init_nilfs(struct the_nilfs *nilfs, struct super_block *sb, char *data)
 	nilfs->ns_mount_state = le16_to_cpu(sbp->s_state);
 
 	err = nilfs_store_log_cursor(nilfs, sbp);
+	if (err)
+		goto failed_sbh;
+
+	err = nilfs_sysfs_create_device_group(sb);
 	if (err)
 		goto failed_sbh;
 
@@ -729,12 +744,13 @@ nilfs_find_or_create_root(struct the_nilfs *nilfs, __u64 cno)
 {
 	struct rb_node **p, *parent;
 	struct nilfs_root *root, *new;
+	int err;
 
 	root = nilfs_lookup_root(nilfs, cno);
 	if (root)
 		return root;
 
-	new = kmalloc(sizeof(*root), GFP_KERNEL);
+	new = kzalloc(sizeof(*root), GFP_KERNEL);
 	if (!new)
 		return NULL;
 
@@ -763,13 +779,19 @@ nilfs_find_or_create_root(struct the_nilfs *nilfs, __u64 cno)
 	new->ifile = NULL;
 	new->nilfs = nilfs;
 	atomic_set(&new->count, 1);
-	atomic_set(&new->inodes_count, 0);
-	atomic_set(&new->blocks_count, 0);
+	atomic64_set(&new->inodes_count, 0);
+	atomic64_set(&new->blocks_count, 0);
 
 	rb_link_node(&new->rb_node, parent, p);
 	rb_insert_color(&new->rb_node, &nilfs->ns_cptree);
 
 	spin_unlock(&nilfs->ns_cptree_lock);
+
+	err = nilfs_sysfs_create_snapshot_group(new);
+	if (err) {
+		kfree(new);
+		new = NULL;
+	}
 
 	return new;
 }
@@ -779,11 +801,12 @@ void nilfs_put_root(struct nilfs_root *root)
 	if (atomic_dec_and_test(&root->count)) {
 		struct the_nilfs *nilfs = root->nilfs;
 
+		nilfs_sysfs_delete_snapshot_group(root);
+
 		spin_lock(&nilfs->ns_cptree_lock);
 		rb_erase(&root->rb_node, &nilfs->ns_cptree);
 		spin_unlock(&nilfs->ns_cptree_lock);
-		if (root->ifile)
-			iput(root->ifile);
+		iput(root->ifile);
 
 		kfree(root);
 	}

@@ -58,8 +58,6 @@ struct v4l2_device {
 	struct v4l2_ctrl_handler *ctrl_handler;
 	/* Device's priority state */
 	struct v4l2_prio_state prio;
-	/* BKL replacement mutex. Temporary solution only. */
-	struct mutex ioctl_lock;
 	/* Keep track of the references to this struct. */
 	struct kref ref;
 	/* Release function that is called when the ref count goes to 0. */
@@ -119,6 +117,14 @@ void v4l2_device_unregister_subdev(struct v4l2_subdev *sd);
  */
 int __must_check
 v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev);
+
+/* Send a notification to v4l2_device. */
+static inline void v4l2_subdev_notify(struct v4l2_subdev *sd,
+				      unsigned int notification, void *arg)
+{
+	if (sd && sd->v4l2_dev && sd->v4l2_dev->notify)
+		sd->v4l2_dev->notify(sd, notification, arg);
+}
 
 /* Iterate over all subdevs. */
 #define v4l2_device_for_each_subdev(sd, v4l2_dev)			\
@@ -188,6 +194,72 @@ v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev);
 	__v4l2_device_call_subdevs_until_err_p(v4l2_dev, __sd,		\
 			!(grpid) || __sd->grp_id == (grpid), o, f ,	\
 			##args);					\
+})
+
+/*
+ * Call the specified callback for all subdevs where grp_id & grpmsk != 0
+ * (if grpmsk == `0, then match them all). Ignore any errors. Note that you
+ * cannot add or delete a subdev while walking the subdevs list.
+ */
+#define v4l2_device_mask_call_all(v4l2_dev, grpmsk, o, f, args...)	\
+	do {								\
+		struct v4l2_subdev *__sd;				\
+									\
+		__v4l2_device_call_subdevs_p(v4l2_dev, __sd,		\
+			!(grpmsk) || (__sd->grp_id & (grpmsk)), o, f ,	\
+			##args);					\
+	} while (0)
+
+/*
+ * Call the specified callback for all subdevs where grp_id & grpmsk != 0
+ * (if grpmsk == `0, then match them all). If the callback returns an error
+ * other than 0 or -ENOIOCTLCMD, then return with that error code. Note that
+ * you cannot add or delete a subdev while walking the subdevs list.
+ */
+#define v4l2_device_mask_call_until_err(v4l2_dev, grpmsk, o, f, args...) \
+({									\
+	struct v4l2_subdev *__sd;					\
+	__v4l2_device_call_subdevs_until_err_p(v4l2_dev, __sd,		\
+			!(grpmsk) || (__sd->grp_id & (grpmsk)), o, f ,	\
+			##args);					\
+})
+
+/*
+ * Does any subdev with matching grpid (or all if grpid == 0) has the given
+ * op?
+ */
+#define v4l2_device_has_op(v4l2_dev, grpid, o, f)			\
+({									\
+	struct v4l2_subdev *__sd;					\
+	bool __result = false;						\
+	list_for_each_entry(__sd, &(v4l2_dev)->subdevs, list) {		\
+		if ((grpid) && __sd->grp_id != (grpid))			\
+			continue;					\
+		if (v4l2_subdev_has_op(__sd, o, f)) {			\
+			__result = true;				\
+			break;						\
+		}							\
+	}								\
+	__result;							\
+})
+
+/*
+ * Does any subdev with matching grpmsk (or all if grpmsk == 0) has the given
+ * op?
+ */
+#define v4l2_device_mask_has_op(v4l2_dev, grpmsk, o, f)			\
+({									\
+	struct v4l2_subdev *__sd;					\
+	bool __result = false;						\
+	list_for_each_entry(__sd, &(v4l2_dev)->subdevs, list) {		\
+		if ((grpmsk) && !(__sd->grp_id & (grpmsk)))		\
+			continue;					\
+		if (v4l2_subdev_has_op(__sd, o, f)) {			\
+			__result = true;				\
+			break;						\
+		}							\
+	}								\
+	__result;							\
 })
 
 #endif
